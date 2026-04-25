@@ -1,0 +1,126 @@
+/* ============================================================
+   MDZip Obsidian Plugin – styles
+   ============================================================ */
+
+/* --- View container ---------------------------------------- */
+.mdz-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* --- Toolbar ----------------------------------------------- */
+.mdz-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex-shrink: 0;
+  gap: 8px;
+  min-height: 36px;
+}
+
+.mdz-toolbar-title {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.mdz-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* --- Toolbar buttons --------------------------------------- */
+.mdz-btn {
+  padding: 2px 10px;
+  font-size: var(--font-ui-small);
+  border-radius: var(--radius-s);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.mdz-btn:hover:not(:disabled) {
+  background: var(--background-modifier-hover);
+}
+
+.mdz-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mdz-btn-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+
+.mdz-btn-active:hover:not(:disabled) {
+  background: var(--interactive-accent-hover);
+}
+
+.mdz-btn-save {
+  font-weight: 600;
+}
+
+/* --- Content area ------------------------------------------ */
+.mdz-content {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* --- Preview ----------------------------------------------- */
+.mdz-preview {
+  flex: 1;
+  padding: 20px 24px;
+  overflow: auto;
+}
+
+/* --- Source editor ----------------------------------------- */
+.mdz-editor {
+  flex: 1;
+  width: 100%;
+  min-height: 100%;
+  box-sizing: border-box;
+  padding: 16px 20px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-text-size);
+  line-height: var(--line-height-normal);
+  border: none;
+  outline: none;
+  resize: none;
+  overflow: auto;
+}
+
+.mdz-editor:focus {
+  outline: none;
+}
+
+/* --- Status / error --------------------------------------- */
+.mdz-status {
+  padding: 20px 24px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.mdz-status.mdz-error {
+  color: var(--text-error);
+  font-style: normal;
+  font-size: var(--font-ui-small);
+  white-space: pre-wrap;
+}
