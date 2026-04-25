@@ -31,6 +31,7 @@ export class MdzView extends FileView {
   private entryPointPath = 'index.md';
   private isDirty = false;
   private isSaving = false;
+  private isLoading = false;
   private archive: MdzArchiveCore | null = null;
 
   // ---- DOM elements (created in onOpen) ----
@@ -86,6 +87,9 @@ export class MdzView extends FileView {
   }
 
   async onLoadFile(file: TFile): Promise<void> {
+    // Prevent overlapping loads (e.g. rapid external modifications)
+    if (this.isLoading) return;
+    this.isLoading = true;
     this.clearContent();
     this.showStatus('Loading…');
 
@@ -119,6 +123,8 @@ export class MdzView extends FileView {
       this.showError(
         `Failed to open .mdz file: ${err instanceof Error ? err.message : String(err)}`
       );
+    } finally {
+      this.isLoading = false;
     }
   }
 
@@ -127,11 +133,12 @@ export class MdzView extends FileView {
     this.archiveBytes = null;
     this.markdownContent = '';
     this.isDirty = false;
+    this.isLoading = false;
   }
 
   /** Re-load when the underlying file changes on disk (e.g. external edit). */
   onModify(file: TFile): void {
-    if (!this.isSaving) {
+    if (!this.isSaving && !this.isLoading) {
       this.onLoadFile(file);
     }
   }
@@ -397,14 +404,15 @@ export class MdzView extends FileView {
 
 /**
  * Encode an ArrayBuffer as a base64 string without exceeding the call-stack
- * limit by processing the bytes in chunks.
+ * limit by processing the bytes in chunks and collecting into an array before
+ * joining (avoids repeated string object allocation).
  */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
-  let binary = '';
+  const chunks: string[] = [];
   const chunkSize = 8192;
   for (let i = 0; i < bytes.byteLength; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    chunks.push(String.fromCharCode(...bytes.subarray(i, i + chunkSize)));
   }
-  return btoa(binary);
+  return btoa(chunks.join(''));
 }
