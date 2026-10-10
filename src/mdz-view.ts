@@ -1,7 +1,24 @@
-import { App, FileView, MarkdownRenderer, Notice, TFile, WorkspaceLeaf } from 'obsidian';
-import { MdzArchiveCore, MdzManifest, MdzPackagerCore } from 'mdzip-core-js';
+import {
+  App,
+  debounce,
+  Editor,
+  FuzzySuggestModal,
+  MarkdownView,
+  Notice,
+  PaneType,
+  parseLinktext,
+  TFile,
+  ViewStateResult,
+  WorkspaceLeaf,
+} from 'obsidian';
+import { MdzArchiveCore } from '@mdzip/core-js';
+import { blockPadding, dropPosition, imageExtension, imageFiles, safeFileStem } from './images';
 
 export const VIEW_TYPE_MDZ = 'mdz-document';
+
+/** Archives above this size autosave less often (each save rewrites the whole file). */
+const LARGE_ARCHIVE_BYTES = 25 * 1024 * 1024;
+const LARGE_ARCHIVE_SAVE_DELAY_MS = 30_000;
 
 /** Represents a JSZip entry with the async() read method. */
 interface ZipEntryLike {
@@ -9,410 +26,769 @@ interface ZipEntryLike {
   async(kind: 'text' | 'arraybuffer' | 'base64'): Promise<string | ArrayBuffer>;
 }
 
-type ViewMode = 'preview' | 'source';
-
 /**
- * Custom FileView for .mdz (MDZip) single-document archives.
+ * Obsidian's own Markdown view (live preview, source mode, reading view,
+ * hotkeys, properties, etc.) backed by a .mdz archive.
  *
- * Supports two display modes:
- *  - preview: renders the entry-point Markdown with Obsidian's renderer,
- *    resolving archive-local images to inline data URIs.
- *  - source: exposes the raw Markdown text in an editable textarea.
+ * The view edits one Markdown document of the archive at a time: the entry
+ * point in document mode, or any document of a project-mode archive. The
+ * current document is part of the view state (`mdzDoc`), so tabs restore to
+ * it and in-archive navigation goes through Obsidian's back/forward history.
  *
- * Changes made in source mode can be saved back into the .mdz archive via
- * the toolbar Save button or the standard Mod+S shortcut.
+ * MarkdownView inherits its file I/O from TextFileView, which reads and
+ * writes the file as plain text. This subclass swaps that I/O for archive
+ * unpack/repack:
+ *
+ *  - `loadFileInternal` (TextFileView's internal loader, used on open) is
+ *    overridden to read the current document out of the archive.
+ *  - `onModify` re-reads the archive when the file changes on disk.
+ *  - `save` (called by autosave, Mod+S and on close) writes the edited
+ *    Markdown back into the archive, preserving every other entry.
+ *
+ * Images inside the archive don't exist in the vault, so Obsidian renders
+ * them as "could not be found" embeds. A MutationObserver replaces those
+ * with blob URLs read from the archive, in both live preview and reading
+ * view.
+ *
+ * If the archive can't be loaded, `archiveBytes` stays null and `save` is a
+ * no-op, so a failed load can never overwrite the .mdz with bad data.
  */
-export class MdzView extends FileView {
-  // ---- internal state ----
-  private mode: ViewMode = 'preview';
-  private markdownContent = '';
+export class MdzView extends MarkdownView {
   private archiveBytes: ArrayBuffer | null = null;
-  private archiveManifest: MdzManifest | null = null;
-  private entryPointPath = 'index.md';
-  private isDirty = false;
-  private isSaving = false;
-  private isLoading = false;
   private archive: MdzArchiveCore | null = null;
-
-  // ---- DOM elements (created in onOpen) ----
-  private toolbarEl!: HTMLElement;
-  private previewBtn!: HTMLButtonElement;
-  private sourceBtn!: HTMLButtonElement;
-  private saveBtn!: HTMLButtonElement;
-  private titleEl!: HTMLElement;
-  private contentAreaEl!: HTMLElement;
-  private previewEl!: HTMLElement;
-  private editorEl!: HTMLTextAreaElement;
-  private statusEl!: HTMLElement;
+  private isProject = false;
+  private entryPointPath = 'index.md';
+  /** Archive path of the Markdown document being edited. */
+  private currentDoc = 'index.md';
+  /** Document requested by the view state that is loading the file. */
+  private pendingDoc: string | null = null;
+  /**
+   * Documents written since `archive` was opened. Saves update
+   * `archiveBytes` but not the parsed `archive`, so reads go through this.
+   */
+  private savedDocs = new Map<string, string>();
+  /** Markdown of the current document as last loaded from / written to the archive. */
+  private lastSavedMarkdown: string | null = null;
+  /** True while an archive write (or a queued one) is running. */
+  private mdzSaving = false;
+  /** Serializes archive writes so saves and image inserts never interleave. */
+  private writeQueue: Promise<void> = Promise.resolve();
+  private errorEl: HTMLElement | null = null;
+  private docBarEl: HTMLElement | null = null;
+  private documentsAction: HTMLElement | null = null;
+  /** Blob URL lookups for the current archive, keyed by archive path (cached as promises so concurrent passes share one URL). */
+  private imageUrls = new Map<string, Promise<string | null>>();
+  private resolveScheduled = false;
+  /** Bumped whenever the archive changes; resolved images record the generation they point at. */
+  private archiveGeneration = 0;
 
   constructor(leaf: WorkspaceLeaf) {
     super(leaf);
+    // TextFileView autosaves 2s after each change. For large archives that
+    // means rewriting a big file constantly, so wait longer; Mod+S, closing
+    // the tab and quitting still save immediately.
+    const requestSave = this.requestSave;
+    const requestSlowSave = debounce(() => void this.save(), LARGE_ARCHIVE_SAVE_DELAY_MS, true);
+    this.requestSave = () => {
+      if ((this.archiveBytes?.byteLength ?? 0) > LARGE_ARCHIVE_BYTES) {
+        this.dirty = true;
+        requestSlowSave();
+      } else {
+        requestSave();
+      }
+    };
   }
-
-  // ---- Obsidian overrides ----
 
   getViewType(): string {
     return VIEW_TYPE_MDZ;
-  }
-
-  getDisplayText(): string {
-    return this.file?.basename ?? 'MDZ Document';
   }
 
   getIcon(): string {
     return 'package';
   }
 
-  async onOpen(): Promise<void> {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.addClass('mdz-view');
-
-    this.buildToolbar();
-    this.buildContent();
-    this.setMode('preview', false);
-
-    // Mod+S saves
-    this.registerDomEvent(contentEl, 'keydown', (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-        e.preventDefault();
-        this.saveCurrentContent();
-      }
-    });
+  canAcceptExtension(extension: string): boolean {
+    return extension === 'mdz';
   }
 
-  async onClose(): Promise<void> {
-    this.archive = null;
-    this.archiveBytes = null;
+  getState(): Record<string, unknown> {
+    const state = super.getState();
+    if (this.currentDoc !== this.entryPointPath) state.mdzDoc = this.currentDoc;
+    return state;
   }
 
-  async onLoadFile(file: TFile): Promise<void> {
-    // Prevent overlapping loads (e.g. rapid external modifications)
-    if (this.isLoading) return;
-    this.isLoading = true;
-    this.clearContent();
-    this.showStatus('Loading…');
+  async setState(state: unknown, result: ViewStateResult): Promise<void> {
+    const s = (state ?? {}) as Record<string, unknown>;
+    const doc = typeof s.mdzDoc === 'string' ? s.mdzDoc : null;
 
-    try {
-      this.archiveBytes = await this.app.vault.readBinary(file);
-      this.archive = await MdzArchiveCore.open(new Uint8Array(this.archiveBytes));
-
-      const archiveMode = await this.archive.resolveMode();
-      if (archiveMode === 'project') {
-        this.showError(
-          'Project-mode .mdz archives are not supported.\n' +
-            'This plugin only supports single-document (document mode) .mdz files.'
-        );
-        return;
+    if (!this.file || s.file !== this.file.path) {
+      // Opening a file: load straight into the requested document.
+      this.pendingDoc = doc;
+      try {
+        await super.setState(state, result);
+      } finally {
+        this.pendingDoc = null;
       }
+      return;
+    }
 
-      this.entryPointPath = await this.archive.resolveEntryPoint();
-      this.archiveManifest = await this.archive.readManifest();
-
-      const entry = this.archive.findEntry(this.entryPointPath) as ZipEntryLike | null;
-      if (!entry) {
-        throw new Error(`Entry point not found in archive: "${this.entryPointPath}"`);
-      }
-      this.markdownContent = (await entry.async('text')) as string;
-
-      this.isDirty = false;
-      this.updateTitle();
-      this.updateSaveButton();
-      await this.renderCurrentMode();
-    } catch (err) {
-      this.showError(
-        `Failed to open .mdz file: ${err instanceof Error ? err.message : String(err)}`
-      );
-    } finally {
-      this.isLoading = false;
+    await super.setState(state, result);
+    const target = doc ?? this.entryPointPath;
+    if (target !== this.currentDoc && (await this.showDocument(target))) {
+      result.history = true;
     }
   }
 
+  onload(): void {
+    super.onload();
+    const observer = new MutationObserver(() => this.scheduleImageResolve());
+    observer.observe(this.contentEl, { childList: true, subtree: true });
+    this.register(() => observer.disconnect());
+
+    this.registerEvent(
+      this.app.workspace.on('editor-paste', (evt, editor, info) => {
+        if (info !== this || evt.defaultPrevented) return;
+        const files = imageFiles(evt.clipboardData);
+        if (!files.length) return;
+        evt.preventDefault();
+        void this.insertImages(files, editor, 'paste');
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on('editor-drop', (evt, editor, info) => {
+        if (info !== this || evt.defaultPrevented) return;
+        const files = imageFiles(evt.dataTransfer);
+        if (!files.length) return;
+        evt.preventDefault();
+        void this.insertImages(files, editor, 'drop', evt);
+      })
+    );
+    // Raw HTML links (`<a href="Author/Book.md">`) don't go through Obsidian's
+    // link handling, so follow the ones that point into the archive here.
+    this.registerDomEvent(this.contentEl, 'click', (evt) => this.followHtmlLink(evt), { capture: true });
+    this.registerDomEvent(this.contentEl, 'auxclick', (evt) => this.followHtmlLink(evt), { capture: true });
+
+    // Large archives may be holding unsaved edits for a while; flush them on quit.
+    this.registerEvent(this.app.workspace.on('quit', (tasks) => tasks.add(() => this.save())));
+  }
+
   async onUnloadFile(file: TFile): Promise<void> {
-    this.archive = null;
-    this.archiveBytes = null;
-    this.markdownContent = '';
-    this.isDirty = false;
-    this.isLoading = false;
+    await super.onUnloadFile(file);
+    this.setArchive(null, null);
+    this.lastSavedMarkdown = null;
+    this.isProject = false;
+    this.clearError();
+    this.updateDocumentUi();
+  }
+
+  // ---- Loading ----
+
+  /** Replaces TextFileView's plain-text loader (called from onLoadFile). */
+  async loadFileInternal(file: TFile, clear: boolean): Promise<void> {
+    this.clearError();
+    try {
+      const bytes = await this.app.vault.readBinary(file);
+      const opened = await openArchive(bytes);
+      const doc = pickDocument(opened.archive, this.pendingDoc, opened.entryPointPath);
+      const markdown = await readDocument(opened.archive, doc);
+      if (markdown === null) throw new Error(`document not found in archive: "${doc}"`);
+
+      this.isProject = opened.mode === 'project';
+      this.entryPointPath = opened.entryPointPath;
+      this.currentDoc = doc;
+      this.setArchive(bytes, opened.archive);
+      this.lastSavedMarkdown = markdown;
+      this.data = markdown;
+      this.setViewData(markdown, clear);
+    } catch (err) {
+      this.setArchive(null, null);
+      this.isProject = false;
+      this.lastSavedMarkdown = null;
+      this.data = '';
+      this.setViewData('', clear);
+      this.showError(err instanceof Error ? err.message : String(err));
+    }
+    this.updateDocumentUi();
   }
 
   /** Re-load when the underlying file changes on disk (e.g. external edit). */
   onModify(file: TFile): void {
-    if (!this.isSaving && !this.isLoading) {
-      this.onLoadFile(file);
-    }
+    if (this.mdzSaving || file !== this.file) return;
+    void this.enqueue(() => this.reloadFromDisk(file));
   }
 
-  // ---- Toolbar ----
+  private async reloadFromDisk(file: TFile): Promise<void> {
+    if (this.file !== file) return;
+    if (!this.archiveBytes) {
+      // Previous load failed; try again from scratch.
+      await this.loadFileInternal(file, false);
+      return;
+    }
+    let bytes: ArrayBuffer;
+    let opened: OpenedArchive;
+    let markdown: string | null;
+    try {
+      bytes = await this.app.vault.readBinary(file);
+      // The modify event from our own write.
+      if (sameBytes(bytes, this.archiveBytes)) return;
+      opened = await openArchive(bytes);
+      markdown = await readDocument(opened.archive, this.currentDoc);
+    } catch {
+      return; // Keep the current state; the next successful change will reload.
+    }
+    if (this.file !== file) return;
 
-  private buildToolbar(): void {
-    const { contentEl } = this;
-    this.toolbarEl = contentEl.createDiv({ cls: 'mdz-toolbar' });
+    this.isProject = opened.mode === 'project';
+    this.entryPointPath = opened.entryPointPath;
+    this.setArchive(bytes, opened.archive);
 
-    this.titleEl = this.toolbarEl.createDiv({ cls: 'mdz-toolbar-title' });
-    this.titleEl.setText('');
+    if (markdown === null) {
+      // The document was removed externally; fall back to the entry point.
+      new Notice(`"${this.currentDoc}" was removed from ${file.name}.`);
+      const entry = (await readDocument(opened.archive, opened.entryPointPath)) ?? '';
+      this.currentDoc = opened.entryPointPath;
+      this.lastSavedMarkdown = entry;
+      this.data = entry;
+      this.setViewData(entry, true);
+      this.updateDocumentUi();
+      return;
+    }
+    this.updateDocumentUi();
 
-    const actions = this.toolbarEl.createDiv({ cls: 'mdz-toolbar-actions' });
+    // A change that didn't touch this document.
+    if (markdown === this.lastSavedMarkdown) return;
 
-    this.previewBtn = actions.createEl('button', {
-      cls: 'mdz-btn',
-      text: 'Preview',
-    });
-    this.previewBtn.addEventListener('click', () => this.setMode('preview', true));
-
-    this.sourceBtn = actions.createEl('button', {
-      cls: 'mdz-btn',
-      text: 'Edit',
-    });
-    this.sourceBtn.addEventListener('click', () => this.setMode('source', true));
-
-    this.saveBtn = actions.createEl('button', {
-      cls: 'mdz-btn mdz-btn-save',
-      text: 'Save',
-    });
-    this.saveBtn.addEventListener('click', () => this.saveCurrentContent());
-    this.saveBtn.disabled = true;
+    const current = this.getViewData();
+    const hasUnsavedEdits = current !== this.lastSavedMarkdown;
+    this.lastSavedMarkdown = markdown;
+    if (hasUnsavedEdits && current !== markdown) {
+      new Notice(
+        `${file.name} changed on disk. Keeping your unsaved edits; saving will overwrite the external change.`
+      );
+      return;
+    }
+    this.data = markdown;
+    this.setViewData(markdown, false);
   }
 
-  private buildContent(): void {
-    const { contentEl } = this;
-    this.contentAreaEl = contentEl.createDiv({ cls: 'mdz-content' });
+  // ---- Documents ----
 
-    this.previewEl = this.contentAreaEl.createDiv({
-      cls: 'mdz-preview markdown-preview-view markdown-rendered',
-    });
-
-    this.editorEl = this.contentAreaEl.createEl('textarea', {
-      cls: 'mdz-editor',
-    });
-    this.editorEl.spellcheck = false;
-    this.editorEl.addEventListener('input', () => {
-      this.isDirty = true;
-      this.updateSaveButton();
-    });
-
-    this.statusEl = this.contentAreaEl.createDiv({ cls: 'mdz-status' });
-    this.statusEl.hide();
+  /** Markdown documents in the archive, sorted by path. */
+  listDocuments(): string[] {
+    if (!this.archive) return [];
+    return this.archive
+      .listEntries()
+      .filter((e) => e.isMarkdown && !e.isDirectory)
+      .map((e) => e.path);
   }
 
-  // ---- Mode switching ----
-
-  private setMode(mode: ViewMode, render = true): void {
-    if (mode === 'source') {
-      // Sync textarea with current content before switching
-      this.editorEl.value = this.markdownContent;
-    } else if (this.mode === 'source') {
-      // Leaving source mode: capture edits
-      this.syncFromEditor();
+  /**
+   * The archive path of a link target, if it's a Markdown document in this
+   * archive. Tries the link relative to the current document, then from the
+   * archive root, with and without a `.md` extension, then (for bare
+   * wikilink names) a unique file-name match.
+   */
+  resolveDocumentLink(linkpath: string): string | null {
+    const archive = this.archive;
+    if (!archive || !linkpath) return null;
+    let decoded = linkpath;
+    try {
+      decoded = decodeURIComponent(linkpath);
+    } catch {
+      // Not URI-encoded; use as-is.
     }
-
-    this.mode = mode;
-
-    if (mode === 'preview') {
-      this.previewEl.show();
-      this.editorEl.hide();
-      this.previewBtn.addClass('mdz-btn-active');
-      this.sourceBtn.removeClass('mdz-btn-active');
-    } else {
-      this.previewEl.hide();
-      this.editorEl.show();
-      this.editorEl.focus();
-      this.sourceBtn.addClass('mdz-btn-active');
-      this.previewBtn.removeClass('mdz-btn-active');
+    const names = /\.[^/.]+$/.test(decoded) ? [decoded] : [decoded, `${decoded}.md`];
+    const isDocument = (path: string) => {
+      const entry = archive.findEntry(path) as ZipEntryLike | null;
+      return !!entry && !entry.dir && MdzArchiveCore.isMarkdownFile(path);
+    };
+    for (const name of names) {
+      const relative = MdzArchiveCore.resolvePath(this.currentDoc, name);
+      if (isDocument(relative)) return relative;
+      const fromRoot = MdzArchiveCore.normalizePath(name.replace(/^\/+/, ''));
+      if (isDocument(fromRoot)) return fromRoot;
     }
-
-    if (render) {
-      this.renderCurrentMode();
+    if (!decoded.includes('/')) {
+      const wanted = names.map((n) => n.toLowerCase());
+      const matches = this.listDocuments().filter((p) =>
+        wanted.includes((p.split('/').pop() ?? '').toLowerCase())
+      );
+      if (matches.length === 1) return matches[0];
     }
+    return null;
   }
 
-  private syncFromEditor(): void {
-    const newContent = this.editorEl.value;
-    if (newContent !== this.markdownContent) {
-      this.markdownContent = newContent;
-      this.isDirty = true;
-      this.updateSaveButton();
-    }
-  }
-
-  // ---- Rendering ----
-
-  private async renderCurrentMode(): Promise<void> {
-    this.statusEl.hide();
-    if (this.mode === 'preview') {
-      await this.renderPreview();
-    } else {
-      this.editorEl.value = this.markdownContent;
-    }
-  }
-
-  private async renderPreview(): Promise<void> {
-    this.previewEl.empty();
-    if (!this.markdownContent) return;
-
-    await MarkdownRenderer.render(
-      this.app,
-      this.markdownContent,
-      this.previewEl,
-      this.file?.path ?? '',
-      this
+  /**
+   * Show a document of the archive, in this tab or (with `newLeaf`) another
+   * one. Goes through the leaf's view state so it lands in back/forward
+   * history.
+   */
+  async openDocument(path: string, newLeaf?: PaneType | boolean, subpath?: string): Promise<void> {
+    const file = this.file;
+    if (!file) return;
+    const leaf = newLeaf ? this.app.workspace.getLeaf(newLeaf) : this.leaf;
+    const base = leaf === this.leaf ? this.getState() : { file: file.path, mode: this.getMode() };
+    await leaf.setViewState(
+      { type: VIEW_TYPE_MDZ, state: { ...base, mdzDoc: path }, active: true },
+      subpath ? { subpath } : undefined
     );
-
-    if (this.archive) {
-      await this.resolvePreviewImages(this.previewEl);
-    }
   }
 
-  /**
-   * Replace `<img>` src attributes that point to archive-relative paths with
-   * inline data URIs, so images from inside the .mdz render correctly.
-   */
-  private async resolvePreviewImages(el: HTMLElement): Promise<void> {
-    if (!this.archive) return;
-
-    const imgs = el.querySelectorAll('img[src]');
-    for (const img of Array.from(imgs)) {
-      const src = img.getAttribute('src');
-      if (
-        !src ||
-        src.startsWith('data:') ||
-        src.startsWith('http://') ||
-        src.startsWith('https://') ||
-        src.startsWith('app://')
-      ) {
-        continue;
-      }
-
-      try {
-        const resolvedPath = MdzArchiveCore.resolvePath(this.entryPointPath, src);
-        const entry = this.archive.findEntry(resolvedPath) as ZipEntryLike | null;
-        if (entry && !entry.dir) {
-          const buffer = (await entry.async('arraybuffer')) as ArrayBuffer;
-          const ext = resolvedPath.split('.').pop()?.toLowerCase() ?? '';
-          const mimeType = MdzArchiveCore.IMAGE_MIME_TYPES[ext] ?? 'application/octet-stream';
-          img.setAttribute('src', `data:${mimeType};base64,${arrayBufferToBase64(buffer)}`);
-        }
-      } catch {
-        // Skip un-resolvable image references silently
-      }
-    }
+  private followHtmlLink(evt: MouseEvent): void {
+    if (evt.type === 'auxclick' && evt.button !== 1) return;
+    const a = (evt.target as HTMLElement | null)?.closest?.('a[href]');
+    if (!a || a.hasClass('internal-link') || a.hasClass('external-link')) return;
+    const href = a.getAttribute('href') ?? '';
+    if (!href || href.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) return;
+    const { path, subpath } = parseLinktext(href);
+    const target = this.resolveDocumentLink(path);
+    if (!target) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    void this.openDocument(target, evt.button === 1 ? 'tab' : modPaneType(evt), subpath || undefined);
   }
 
-  // ---- Public accessors ----
+  /** Save the current document, then switch the editor to `path`. */
+  private async showDocument(path: string): Promise<boolean> {
+    const file = this.file;
+    if (!file) return false;
+    let shown = false;
+    await this.enqueue(async () => {
+      if (this.file !== file || !this.archive) return;
+      await this.writeArchive(file, []);
+      const markdown = await this.readDoc(path);
+      if (markdown === null) {
+        new Notice(`"${path}" isn't in ${file.name}.`);
+        return;
+      }
+      this.currentDoc = path;
+      this.lastSavedMarkdown = markdown;
+      this.data = markdown;
+      this.setViewData(markdown, true);
+      this.updateDocumentUi();
+      // Lets the word count (and similar) pick up the new document.
+      this.app.workspace.trigger('quick-preview', file, markdown);
+      shown = true;
+    });
+    return shown;
+  }
 
-  /**
-   * Returns the current Markdown text held by the view.
-   *
-   * If the view is in source mode, flushes the textarea first so the value
-   * is always up-to-date.
-   */
-  getMarkdownContent(): string {
-    if (this.mode === 'source') {
-      this.syncFromEditor();
+  private async readDoc(path: string): Promise<string | null> {
+    const saved = this.savedDocs.get(path);
+    if (saved !== undefined) return saved;
+    return this.archive ? readDocument(this.archive, path) : null;
+  }
+
+  /** Pick a document of the archive to open. */
+  chooseDocument(): void {
+    const documents = this.listDocuments();
+    if (!documents.length) return;
+    new DocumentPicker(this.app, documents, (path, evt) => {
+      void this.openDocument(path, modPaneType(evt));
+    }).open();
+  }
+
+  /** Document bar and header action: shown for project archives, or when off the entry point. */
+  private updateDocumentUi(): void {
+    const show = !!this.archive && (this.isProject || this.currentDoc !== this.entryPointPath);
+
+    if (this.isProject && !this.documentsAction) {
+      this.documentsAction = this.addAction('files', 'Documents in this archive', () => this.chooseDocument());
+    } else if (!this.isProject && this.documentsAction) {
+      this.documentsAction.remove();
+      this.documentsAction = null;
     }
-    return this.markdownContent;
+
+    if (!show) {
+      this.docBarEl?.remove();
+      this.docBarEl = null;
+      return;
+    }
+    if (!this.docBarEl) {
+      this.docBarEl = createDiv({ cls: 'mdz-docbar' });
+    }
+    this.docBarEl.empty();
+    const pathEl = this.docBarEl.createDiv({ cls: 'mdz-docbar-path' });
+    const parts = this.currentDoc.split('/');
+    parts.forEach((part, i) => {
+      if (i > 0) pathEl.createSpan({ cls: 'mdz-docbar-sep', text: '/' });
+      pathEl.createSpan({ cls: i === parts.length - 1 ? 'mdz-docbar-name' : 'mdz-docbar-dir', text: part });
+    });
+    pathEl.setAttribute('title', this.currentDoc);
+    if (this.currentDoc !== this.entryPointPath) {
+      const home = this.docBarEl.createEl('button', { cls: 'mdz-docbar-btn', text: 'Entry point' });
+      home.addEventListener('click', () => void this.openDocument(this.entryPointPath));
+    }
+    const pick = this.docBarEl.createEl('button', { cls: 'mdz-docbar-btn', text: 'Documents…' });
+    pick.addEventListener('click', () => this.chooseDocument());
+    if (this.errorEl) this.errorEl.after(this.docBarEl);
+    else this.contentEl.prepend(this.docBarEl);
   }
 
   // ---- Saving ----
 
+  /** Replaces TextFileView's plain-text save with an archive repack. */
+  async save(clear?: boolean): Promise<void> {
+    this.dirty = false;
+    const file = this.file;
+    if (!file) return;
+    await this.enqueue(() => this.writeArchive(file, []));
+  }
+
   /**
-   * Persist the current markdown content back into the .mdz archive.
-   *
-   * Uses `MdzArchiveCore.addFile` to update the entry-point file while
-   * preserving the rest of the archive (other files, assets, existing
-   * manifest timestamps, etc.).
+   * Write the editor's Markdown, plus any new assets, into the archive in a
+   * single file write. Only runs from the write queue.
    */
-  async saveCurrentContent(): Promise<void> {
-    if (this.isSaving) return;
-    if (!this.file || !this.archiveBytes) {
-      new Notice('No file loaded.');
+  private async writeArchive(file: TFile, assets: ArchiveAsset[]): Promise<void> {
+    // The view may have switched files while this write was queued.
+    if (this.file !== file || !this.archiveBytes) return;
+    const markdown = this.getViewData();
+    const doc = this.currentDoc;
+    if (!assets.length && markdown === this.lastSavedMarkdown) return;
+
+    try {
+      let bytes = this.archiveBytes;
+      for (const asset of assets) {
+        const result = await MdzArchiveCore.addFile(new Uint8Array(bytes), asset.path, asset.bytes);
+        bytes = await result.blob.arrayBuffer();
+      }
+      if (markdown !== this.lastSavedMarkdown) {
+        const result = await MdzArchiveCore.addFile(new Uint8Array(bytes), doc, markdown);
+        bytes = await result.blob.arrayBuffer();
+      }
+      await this.app.vault.modifyBinary(file, bytes);
+      this.lastSavedMarkdown = markdown;
+      this.data = markdown;
+      if (assets.length) {
+        // Re-open so the new images resolve.
+        this.setArchive(bytes, await MdzArchiveCore.open(new Uint8Array(bytes)));
+      } else {
+        this.archiveBytes = bytes;
+        this.savedDocs.set(doc, markdown);
+      }
+    } catch (err) {
+      new Notice(`Saving ${file.name} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Run `task` after every earlier queued archive operation has finished. */
+  private enqueue(task: () => Promise<void>): Promise<void> {
+    const run = this.writeQueue.then(async () => {
+      this.mdzSaving = true;
+      try {
+        await task();
+      } finally {
+        this.mdzSaving = false;
+      }
+    });
+    this.writeQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  // ---- Pasting / dropping images ----
+
+  /**
+   * Store pasted or dropped images inside the archive (next to the current
+   * document, under `images/`) and link them with standard Markdown image
+   * syntax, matching the MDZip editor's paste behavior.
+   *
+   * The link is inserted immediately; the image and the updated Markdown are
+   * then written to the archive together.
+   */
+  private async insertImages(
+    files: File[],
+    editor: Editor,
+    source: 'paste' | 'drop',
+    evt?: DragEvent
+  ): Promise<void> {
+    const file = this.file;
+    const archive = this.archive;
+    if (!file || !archive || !this.archiveBytes) {
+      new Notice("Can't add images: this .mdz file didn't load.");
       return;
     }
 
-    // Capture latest edits if in source mode
-    if (this.mode === 'source') {
-      this.syncFromEditor();
+    const baseDir = this.currentDoc.includes('/')
+      ? this.currentDoc.slice(0, this.currentDoc.lastIndexOf('/') + 1)
+      : '';
+    const taken = new Set<string>();
+    const assets: ArchiveAsset[] = [];
+    const links: string[] = [];
+    for (const image of files) {
+      const ext = imageExtension(image);
+      const stem =
+        source === 'paste' ? `pasted-${Date.now()}` : safeFileStem(image.name) || `dropped-${Date.now()}`;
+      let relPath = `images/${stem}.${ext}`;
+      for (let n = 1; taken.has(relPath.toLowerCase()) || archive.findEntry(baseDir + relPath); n++) {
+        relPath = `images/${stem}-${n}.${ext}`;
+      }
+      taken.add(relPath.toLowerCase());
+      assets.push({ path: baseDir + relPath, bytes: new Uint8Array(await image.arrayBuffer()) });
+      const alt = source === 'paste' ? 'Pasted image' : stem;
+      links.push(`![${alt}](${relPath})`);
     }
+    if (this.file !== file) return;
 
-    this.isSaving = true;
-    this.saveBtn.disabled = true;
-    this.saveBtn.setText('Saving…');
+    const dropOffset = evt ? dropPosition(editor, evt) : null;
+    const from = dropOffset !== null ? editor.offsetToPos(dropOffset) : editor.getCursor('from');
+    const to = dropOffset !== null ? from : editor.getCursor('to');
+    const { before, after } = blockPadding(editor, from, to);
+    const separator = before || after ? '\n\n' : '\n';
+    const inserted = before + links.join(separator) + after;
+    editor.replaceRange(inserted, from, to);
+    editor.setCursor(editor.offsetToPos(editor.posToOffset(from) + inserted.length));
 
+    await this.enqueue(() => this.writeArchive(file, assets));
+  }
+
+  // ---- Public accessors ----
+
+  /** Returns the current Markdown text held by the view. */
+  getMarkdownContent(): string {
+    return this.getViewData();
+  }
+
+  /** Archive path of the document being edited. */
+  getCurrentDocument(): string {
+    return this.currentDoc;
+  }
+
+  // ---- Archive images ----
+
+  /**
+   * Swap the archive (or clear it). Image blob URLs belong to the previous
+   * archive bytes, so they're revoked and re-resolved.
+   */
+  private setArchive(bytes: ArrayBuffer | null, archive: MdzArchiveCore | null): void {
+    this.archiveBytes = bytes;
+    this.archive = archive;
+    this.savedDocs.clear();
+    for (const pending of this.imageUrls.values()) {
+      void pending.then((url) => url && URL.revokeObjectURL(url));
+    }
+    this.imageUrls.clear();
+    this.archiveGeneration++;
+    this.scheduleImageResolve();
+  }
+
+  private scheduleImageResolve(): void {
+    if (this.resolveScheduled) return;
+    this.resolveScheduled = true;
+    window.setTimeout(() => {
+      this.resolveScheduled = false;
+      void this.resolveImages();
+    }, 0);
+  }
+
+  /**
+   * Obsidian renders image links it can't find in the vault as
+   * `.internal-embed.mod-empty-attachment[src]` (both live preview and
+   * reading view). Raw HTML `<img>` tags keep their relative `src`. Point
+   * both at the image inside the archive.
+   */
+  private async resolveImages(): Promise<void> {
+    const archive = this.archive;
+    if (!archive) return;
+    const generation = String(this.archiveGeneration);
+
+    // Links to documents in the archive aren't in the vault, so Obsidian
+    // fades them as unresolved; they do resolve (see followArchiveLinks).
+    this.contentEl.querySelectorAll<HTMLElement>('a.internal-link.is-unresolved[data-href]').forEach((a) => {
+      if (this.resolveDocumentLink(parseLinktext(a.getAttribute('data-href') ?? '').path)) {
+        a.removeClass('is-unresolved');
+      }
+    });
+
+    // Claim new candidates, remembering the path they referenced.
+    this.contentEl
+      .querySelectorAll<HTMLElement>('.internal-embed.mod-empty-attachment[src]:not([data-mdz-src])')
+      .forEach((el) => el.setAttribute('data-mdz-src', el.getAttribute('src') ?? ''));
+    this.contentEl.querySelectorAll<HTMLImageElement>('img[src]:not([data-mdz-src])').forEach((img) => {
+      const src = img.getAttribute('src') ?? '';
+      if (src && !/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith('//')) {
+        img.setAttribute('data-mdz-src', src);
+      }
+    });
+
+    // Point every claimed element at the current archive (new ones, and
+    // ones whose blob URLs belonged to a previous archive).
+    const pending = this.contentEl.querySelectorAll<HTMLElement>(
+      '[data-mdz-src]:not(img.mdz-embed-img)'
+    );
+    for (const el of Array.from(pending)) {
+      if (el.getAttribute('data-mdz-gen') === generation) continue;
+      const url = await this.imageUrl(archive, el.getAttribute('data-mdz-src') ?? '');
+      // The archive changed while reading; the new archive's pass takes over.
+      if (archive !== this.archive) return;
+      el.setAttribute('data-mdz-gen', generation);
+      if (!url) continue;
+      if (el instanceof HTMLImageElement) {
+        el.setAttribute('src', url);
+        continue;
+      }
+      let img = el.querySelector<HTMLImageElement>('img.mdz-embed-img');
+      if (!img) {
+        el.empty();
+        el.removeClass('file-embed', 'mod-empty-attachment');
+        el.addClass('image-embed', 'mdz-image-embed');
+        img = el.createEl('img', { cls: 'mdz-embed-img', attr: { alt: el.getAttribute('alt') ?? '' } });
+      }
+      img.setAttribute('src', url);
+    }
+  }
+
+  /** Blob URL for an archive image referenced from the current document, or null. */
+  private imageUrl(archive: MdzArchiveCore, src: string): Promise<string | null> {
+    // Only read from the current archive, so every URL lands in the cache
+    // and is revoked when the archive changes.
+    if (archive !== this.archive) return Promise.resolve(null);
+    let ref = src.split('|')[0].split('#')[0];
     try {
-      const result = await MdzArchiveCore.addFile(
-        new Uint8Array(this.archiveBytes),
-        this.entryPointPath,
-        this.markdownContent
-      );
-
-      this.archiveBytes = await result.blob.arrayBuffer();
-
-      // Re-open the updated archive so image resolution stays in sync
-      this.archive = await MdzArchiveCore.open(new Uint8Array(this.archiveBytes));
-
-      await this.app.vault.modifyBinary(this.file, this.archiveBytes);
-
-      this.isDirty = false;
-      this.updateSaveButton();
-      new Notice('Saved.');
-    } catch (err) {
-      new Notice(`Save failed: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      this.isSaving = false;
-      this.saveBtn.setText('Save');
-      this.updateSaveButton();
+      ref = decodeURIComponent(ref);
+    } catch {
+      // Not URI-encoded; use as-is.
     }
+    const path = MdzArchiveCore.resolvePath(this.currentDoc, ref);
+    let pending = this.imageUrls.get(path);
+    if (!pending) {
+      pending = readImage(archive, path);
+      this.imageUrls.set(path, pending);
+    }
+    return pending;
   }
 
-  // ---- Helpers ----
-
-  private updateTitle(): void {
-    const title = this.archiveManifest?.title ?? this.file?.basename ?? '';
-    const suffix = this.entryPointPath !== 'index.md' ? ` (${this.entryPointPath})` : '';
-    this.titleEl.setText(title + suffix);
-  }
-
-  private updateSaveButton(): void {
-    this.saveBtn.disabled = !this.isDirty;
-  }
-
-  private clearContent(): void {
-    this.previewEl?.empty();
-    if (this.editorEl) this.editorEl.value = '';
-    this.statusEl?.hide();
-    this.titleEl?.setText('');
-  }
-
-  private showStatus(message: string): void {
-    this.previewEl.hide();
-    this.editorEl.hide();
-    this.statusEl.setText(message);
-    this.statusEl.show();
-  }
+  // ---- Errors ----
 
   private showError(message: string): void {
-    this.previewEl.hide();
-    this.editorEl.hide();
-    this.statusEl.empty();
-    this.statusEl.addClass('mdz-error');
-    this.statusEl.createEl('p', { text: message });
-    this.statusEl.show();
+    this.clearError();
+    this.errorEl = this.contentEl.createDiv({ cls: 'mdz-error' });
+    this.errorEl.createEl('p', { text: `Can't open this .mdz file: ${message}` });
+    this.errorEl.createEl('p', { text: 'Changes made here will not be saved.' });
+    this.contentEl.prepend(this.errorEl);
+  }
+
+  private clearError(): void {
+    this.errorEl?.remove();
+    this.errorEl = null;
   }
 }
 
-// ---- Utility ----
-
-/**
- * Encode an ArrayBuffer as a base64 string without exceeding the call-stack
- * limit by processing the bytes in chunks and collecting into an array before
- * joining (avoids repeated string object allocation).
- */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const chunks: string[] = [];
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.byteLength; i += chunkSize) {
-    chunks.push(String.fromCharCode(...bytes.subarray(i, i + chunkSize)));
+// TextFileView internals this view relies on (present at runtime, not in
+// obsidian.d.ts).
+declare module 'obsidian' {
+  interface TextFileView {
+    dirty: boolean;
   }
-  return btoa(chunks.join(''));
+}
+
+/** Fuzzy picker over the Markdown documents of an archive. */
+class DocumentPicker extends FuzzySuggestModal<string> {
+  constructor(
+    app: App,
+    private documents: string[],
+    private onPick: (path: string, evt: MouseEvent | KeyboardEvent) => void
+  ) {
+    super(app);
+    this.setPlaceholder('Open a document in this archive…');
+    this.setInstructions([
+      { command: '↵', purpose: 'to open' },
+      { command: 'Ctrl/⌘ ↵', purpose: 'to open in a new tab' },
+    ]);
+  }
+
+  getItems(): string[] {
+    return this.documents;
+  }
+
+  getItemText(path: string): string {
+    return path;
+  }
+
+  onChooseItem(path: string, evt: MouseEvent | KeyboardEvent): void {
+    this.onPick(path, evt);
+  }
+}
+
+/** Ctrl/⌘ opens in a new tab, matching Obsidian's link behavior. */
+function modPaneType(evt: MouseEvent | KeyboardEvent): PaneType | false {
+  return evt.ctrlKey || evt.metaKey ? 'tab' : false;
+}
+
+interface OpenedArchive {
+  archive: MdzArchiveCore;
+  mode: 'document' | 'project';
+  entryPointPath: string;
+}
+
+/** Open an archive and find its mode and entry point. */
+export async function openArchive(bytes: ArrayBuffer): Promise<OpenedArchive> {
+  const archive = await MdzArchiveCore.open(new Uint8Array(bytes));
+  const mode = (await archive.resolveMode()) === 'project' ? 'project' : 'document';
+  let entryPointPath: string | null = null;
+  try {
+    entryPointPath = await archive.resolveEntryPoint();
+  } catch (err) {
+    if (mode === 'document') throw err;
+  }
+  if (!entryPointPath || !archive.findEntry(entryPointPath)) {
+    // A project archive SHOULD declare an entry point; fall back to its first document.
+    const first = archive.listEntries().find((e) => e.isMarkdown && !e.isDirectory);
+    if (mode === 'document' || !first) {
+      throw new Error(`entry point not found in archive: "${entryPointPath ?? 'index.md'}"`);
+    }
+    entryPointPath = first.path;
+  }
+  return { archive, mode, entryPointPath };
+}
+
+/** The entry-point Markdown of an archive. */
+export async function readEntryMarkdown(bytes: ArrayBuffer): Promise<string> {
+  const { archive, entryPointPath } = await openArchive(bytes);
+  return (await readDocument(archive, entryPointPath)) ?? '';
+}
+
+/** `preferred` if it's a document in the archive, else the entry point. */
+function pickDocument(archive: MdzArchiveCore, preferred: string | null, entryPointPath: string): string {
+  if (preferred && MdzArchiveCore.isMarkdownFile(preferred)) {
+    const entry = archive.findEntry(preferred) as ZipEntryLike | null;
+    if (entry && !entry.dir) return preferred;
+  }
+  return entryPointPath;
+}
+
+/** Text of a document in the archive, or null if it isn't there. */
+async function readDocument(archive: MdzArchiveCore, path: string): Promise<string | null> {
+  const entry = archive.findEntry(path) as ZipEntryLike | null;
+  if (!entry || entry.dir) return null;
+  return (await entry.async('text')) as string;
+}
+
+/** Blob URL for an image entry, or null if it isn't an image in the archive. */
+async function readImage(archive: MdzArchiveCore, path: string): Promise<string | null> {
+  try {
+    const entry = archive.findEntry(path) as ZipEntryLike | null;
+    const ext = path.split('.').pop()?.toLowerCase() ?? '';
+    const mimeType = MdzArchiveCore.IMAGE_MIME_TYPES[ext];
+    if (!entry || entry.dir || !mimeType) return null;
+    const buffer = (await entry.async('arraybuffer')) as ArrayBuffer;
+    return URL.createObjectURL(new Blob([buffer], { type: mimeType }));
+  } catch {
+    return null; // Un-resolvable reference; leave Obsidian's placeholder in place.
+  }
+}
+
+/** An entry to add to the archive. */
+interface ArchiveAsset {
+  path: string;
+  bytes: Uint8Array;
+}
+
+function sameBytes(a: ArrayBuffer, b: ArrayBuffer | null): boolean {
+  if (!b || a.byteLength !== b.byteLength) return false;
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  for (let i = 0; i < x.length; i++) {
+    if (x[i] !== y[i]) return false;
+  }
+  return true;
 }

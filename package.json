@@ -7,7 +7,12 @@
     "dev": "node esbuild.config.mjs",
     "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production"
   },
-  "keywords": ["obsidian", "mdz", "mdzip", "markdown"],
+  "keywords": [
+    "obsidian",
+    "mdz",
+    "mdzip",
+    "markdown"
+  ],
   "author": "mdzip-project",
   "license": "Apache-2.0",
   "devDependencies": {
@@ -18,6 +23,6 @@
     "typescript": "^5.4.0"
   },
   "dependencies": {
-    "mdzip-core-js": "^1.1.0"
+    "@mdzip/core-js": "^1.5.0"
   }
 }
