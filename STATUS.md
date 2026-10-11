@@ -1,4 +1,6 @@
 Status: awaiting-test
-Last:   Pasting an image into a .md note offers to convert it to .mdz (setting: ask / convert / vault) — please test
+Last:   Test vault (scripts/make-test-vault.py → ../TestVault) built + verified; plugin on local core-js 1.2.0 entry-point rules (revert file: dep before release) — please test
 
-Also: project-mode support; paste spacing; word count; mode-switch fix + text-write guard; images in archive; real Obsidian editor; @mdzip/core-js ^1.5.0.
+Owner to-do (review/commit/release steps): ../planning/owner-todo.md
+
+Also: graph + MDZip search; links out of/into archives; paste-to-convert; project mode; mode-switch fix + text-write guard; images in archive; real Obsidian editor; @mdzip/core-js ^1.5.0.

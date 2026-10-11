@@ -1,4 +1,4 @@
-import { App, Editor, EditorPosition, MarkdownView, Modal, moment, Notice, Setting, TFile } from 'obsidian';
+import { App, Editor, EditorPosition, MarkdownView, Modal, Notice, Setting, TFile } from 'obsidian';
 import { MdzArchiveCore, MdzPackagerCore } from '@mdzip/core-js';
 import { blockPadding, imageExtension, safeFileStem } from './images';
 import { VIEW_TYPE_MDZ } from './mdz-view';
@@ -198,8 +198,8 @@ export async function pasteIntoVault(
   for (const image of images) {
     const name =
       source === 'paste'
-        ? `Pasted image ${moment().format('YYYYMMDDHHmmss')}.${imageExtension(image)}`
-        : image.name || `Dropped image ${moment().format('YYYYMMDDHHmmss')}.${imageExtension(image)}`;
+        ? `Pasted image ${timestamp()}.${imageExtension(image)}`
+        : image.name || `Dropped image ${timestamp()}.${imageExtension(image)}`;
     const path = await app.fileManager.getAvailablePathForAttachment(name, file.path);
     const saved = await app.vault.createBinary(path, await image.arrayBuffer());
     links.push('!' + app.fileManager.generateMarkdownLink(saved, file.path));
@@ -272,6 +272,19 @@ function availablePath(app: App, folder: string, name: string, ext: string): str
   let path = `${prefix}${name}.${ext}`;
   for (let n = 1; app.vault.getAbstractFileByPath(path); n++) path = `${prefix}${name} ${n}.${ext}`;
   return path;
+}
+
+/** Local time as YYYYMMDDHHmmss, the stamp Obsidian puts in pasted image names. */
+function timestamp(date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    String(date.getFullYear()) +
+    pad(date.getMonth() + 1) +
+    pad(date.getDate()) +
+    pad(date.getHours()) +
+    pad(date.getMinutes()) +
+    pad(date.getSeconds())
+  );
 }
 
 function escapeAttr(value: string): string {

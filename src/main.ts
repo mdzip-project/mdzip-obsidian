@@ -10,7 +10,14 @@ import {
   WorkspaceLeaf,
 } from 'obsidian';
 import { MdzPackagerCore } from '@mdzip/core-js';
-import { MdzView, VIEW_TYPE_MDZ, readEntryMarkdown } from './mdz-view';
+import { MdzView, VIEW_TYPE_MDZ, openArchive, readEntryMarkdown } from './mdz-view';
+import { isBareName, LinkTarget, mentionsArchive } from './links';
+import { ArchiveIndex, indexOf, VaultLinks } from './vault-links';
+import { ArchiveCatalog, nodeId } from './archive-catalog';
+import { GraphIntegration } from './graph';
+import { MdzSearchView, VIEW_TYPE_MDZ_SEARCH } from './search-view';
+import { buildLinkIndex } from './link-index';
+import { MdzLinksView, VIEW_TYPE_MDZ_LINKS } from './links-view';
 import { ConvertNoteModal, convertNoteToMdz, InsertTarget, pasteIntoVault } from './convert';
 import { dropPosition, imageFiles } from './images';
 import { DEFAULT_SETTINGS, MdzSettings, MdzSettingTab } from './settings';
@@ -30,6 +37,14 @@ import { DEFAULT_SETTINGS, MdzSettings, MdzSettingTab } from './settings';
  *    always/never per the plugin setting). "Convert note to .mdz" does the
  *    same without an image.
  *
+ *  - Archive documents in Obsidian's graph and local graph (nodes and links
+ *    added to the graph views' data), and an "MDZip search" view that
+ *    searches inside every archive, since Obsidian's own index only covers
+ *    .md files.
+ *
+ *  - An "MDZip links" panel listing incoming and outgoing links for archive
+ *    documents, and archive documents that link to a regular note.
+ *
  *  - "Export note as .mdz" command – packages the active Markdown note into
  *    a new .mdz file placed alongside it in the vault.
  *
@@ -38,13 +53,55 @@ import { DEFAULT_SETTINGS, MdzSettings, MdzSettingTab } from './settings';
  */
 export default class MdzPlugin extends Plugin {
   settings: MdzSettings = { ...DEFAULT_SETTINGS };
+  links!: VaultLinks;
+  catalog!: ArchiveCatalog;
+  graph!: GraphIntegration;
 
   async onload(): Promise<void> {
     await this.loadSettings();
     this.addSettingTab(new MdzSettingTab(this.app, this));
 
+    // Link resolution between the vault and archives (spec Sections 9.3–9.5)
+    this.links = new VaultLinks(
+      this.app,
+      (path) => this.openArchiveIndex(path),
+      async (bytes) => {
+        const { archive, entryPointPath } = await openArchive(bytes);
+        const entries = archive
+          .listEntries()
+          .filter((e) => !e.isDirectory)
+          .map((e) => e.path);
+        return indexOf(entries, entryPointPath);
+      }
+    );
+
     // Register the custom view for .mdz files
-    this.registerView(VIEW_TYPE_MDZ, (leaf) => new MdzView(leaf));
+    this.registerView(VIEW_TYPE_MDZ, (leaf) => new MdzView(leaf, this.links));
+
+    // Archive documents in the graph, and search inside archives
+    this.catalog = new ArchiveCatalog(this.app, this.links);
+    this.graph = new GraphIntegration(this.app, this.catalog, (localFile) => this.graphFocus(localFile));
+    this.register(
+      this.catalog.onChange(() => {
+        void this.graph.refresh();
+        this.refreshLinksViews();
+      })
+    );
+    this.register(() => this.graph.unhookAll());
+    this.registerArchiveIndexing();
+    this.registerView(VIEW_TYPE_MDZ_SEARCH, (leaf) => new MdzSearchView(leaf, this.catalog));
+    this.addRibbonIcon('package-search', 'Search MDZip archives', () => void this.openSearch());
+    this.registerView(VIEW_TYPE_MDZ_LINKS, (leaf) => new MdzLinksView(leaf, () => this.linkIndex()));
+    this.addCommand({
+      id: 'show-links',
+      name: 'Show links for the current document',
+      callback: () => void this.openLinksPanel(),
+    });
+    this.addCommand({
+      id: 'search-archives',
+      name: 'Search inside .mdz files',
+      callback: () => void this.openSearch(),
+    });
 
     // Tell Obsidian to open .mdz files with this plugin's view
     this.registerExtensions(['mdz'], VIEW_TYPE_MDZ);
@@ -57,7 +114,7 @@ export default class MdzPlugin extends Plugin {
     // Keep .mdz tabs in the MDZip view when Obsidian switches Markdown modes
     this.redirectMarkdownViewState();
 
-    // Links from a .mdz to documents inside the same archive open there
+    // Links inside archives, out of them to vault files, and into them from notes
     this.followArchiveLinks();
 
     // Images pasted/dropped into Markdown notes: offer to convert the note
@@ -277,46 +334,199 @@ export default class MdzPlugin extends Plugin {
   /**
    * Obsidian resolves link clicks (reading view, live preview, Ctrl-click,
    * wikilinks) through `WorkspaceLeaf.openLinkText`, which looks the target
-   * up in the vault and, if it isn't there, creates a new note. For links
-   * from a .mdz whose target is a document inside the same archive, open
-   * that document in the MDZip view instead. Other links behave as usual.
+   * up in the vault and, if it isn't there, creates a new note. That gets
+   * archive links wrong: Obsidian treats a `.mdz` as a file, not a
+   * directory, so links out of an archive land one level too high, and links
+   * into one (`Project.mdz/docs/a.md`) create a stray note. Resolve these
+   * links with the spec's rules (Sections 9.3–9.5) first:
+   *
+   *  - from a document inside an archive: every link except external URLs;
+   *  - from a regular note: links that name an `.mdz` archive.
+   *
+   * Bare names (`[[Notes]]`) that don't match anything in the archive keep
+   * Obsidian's vault-wide name lookup. openLinkText doesn't say whether a
+   * link was a wikilink or a Markdown link, so this also covers single-name
+   * Markdown links (`[Notes](Notes.md)`), matching how Obsidian treats them
+   * elsewhere; strictly, the spec (Section 9.3) would leave those unresolved.
+   * Any other link that doesn't resolve shows a notice instead of creating a
+   * note.
    */
   private followArchiveLinks(): void {
     const proto = WorkspaceLeaf.prototype;
     const original = proto.openLinkText;
-    const findView = (leaf: WorkspaceLeaf, sourcePath: string): MdzView | null => {
-      const candidates = [leaf.view, this.app.workspace.getActiveViewOfType(MdzView)];
-      this.app.workspace.getLeavesOfType(VIEW_TYPE_MDZ).forEach((l) => candidates.push(l.view));
-      for (const view of candidates) {
-        if (view instanceof MdzView && view.file?.path === sourcePath) return view;
-      }
-      return null;
-    };
+    const plugin = this;
     const patched = async function (
       this: WorkspaceLeaf,
       linktext: string,
       sourcePath: string,
       openViewState?: OpenViewState
     ): Promise<void> {
-      if (/\.mdz$/i.test(sourcePath)) {
-        const source = findView(this, sourcePath);
-        const { path, subpath } = parseLinktext(linktext);
-        const target = source?.resolveDocumentLink(path);
-        if (source && target) {
-          const base = this.view === source ? source.getState() : { file: sourcePath, mode: source.getMode() };
-          await this.setViewState(
-            { type: VIEW_TYPE_MDZ, state: { ...base, mdzDoc: target }, active: openViewState?.active ?? true },
-            { ...(openViewState?.eState ?? {}), ...(subpath ? { subpath } : {}) }
-          );
-          return;
-        }
-      }
+      if (await plugin.openArchiveLink(this, linktext, sourcePath, openViewState)) return;
       return original.call(this, linktext, sourcePath, openViewState);
     };
     proto.openLinkText = patched;
     this.register(() => {
       if (proto.openLinkText === patched) proto.openLinkText = original;
     });
+  }
+
+  /** Open `linktext` in `leaf` if it's an archive link; false to let Obsidian handle it. */
+  private async openArchiveLink(
+    leaf: WorkspaceLeaf,
+    linktext: string,
+    sourcePath: string,
+    openViewState?: OpenViewState
+  ): Promise<boolean> {
+    const { path, subpath } = parseLinktext(linktext);
+    const fromArchive = /\.mdz$/i.test(sourcePath);
+    let target: LinkTarget;
+
+    if (fromArchive) {
+      const source = this.findMdzView(leaf, sourcePath);
+      if (!source) return false;
+      target = await source.resolveLink(path);
+    } else {
+      if (!mentionsArchive(path)) return false;
+      target = await this.links.resolve({ host: sourcePath }, path);
+      if (target.kind === 'unresolved') {
+        // Obsidian-style vault-absolute or shortest-name links to the archive.
+        target = (await this.links.resolveByName(sourcePath, path)) ?? target;
+      }
+    }
+
+    const eState = { ...(openViewState?.eState ?? {}), ...(subpath ? { subpath } : {}) };
+    const active = openViewState?.active ?? true;
+    switch (target.kind) {
+      case 'url':
+        return false;
+      case 'internal':
+        await this.openInArchive(leaf, sourcePath, target.entry, active, eState);
+        return true;
+      case 'archive':
+        await this.openInArchive(leaf, target.archive, target.entry, active, eState);
+        return true;
+      case 'host': {
+        const file = this.links.vaultFile(target.path);
+        if (!file) return false;
+        await leaf.openFile(file, { ...openViewState, active, eState });
+        return true;
+      }
+      case 'unresolved':
+        if (fromArchive && isBareName(path) && this.app.metadataCache.getFirstLinkpathDest(path, sourcePath)) {
+          return false;
+        }
+        new Notice(unresolvedMessage(path, target.reason));
+        return true;
+    }
+  }
+
+  /** Show `entry` of the archive at `archivePath` in `leaf`, keeping its mode when it's already that archive. */
+  private async openInArchive(
+    leaf: WorkspaceLeaf,
+    archivePath: string,
+    entry: string,
+    active: boolean,
+    eState: Record<string, unknown>
+  ): Promise<void> {
+    const view = leaf.view;
+    const base = view instanceof MdzView && view.file?.path === archivePath ? view.getState() : { file: archivePath };
+    await leaf.setViewState({ type: VIEW_TYPE_MDZ, state: { ...base, mdzDoc: entry }, active }, eState);
+  }
+
+  /** The MdzView showing `sourcePath`: preferably in `leaf`, then the active one, then any. */
+  private findMdzView(leaf: WorkspaceLeaf, sourcePath: string): MdzView | null {
+    const candidates = [leaf.view, this.app.workspace.getActiveViewOfType(MdzView)];
+    this.app.workspace.getLeavesOfType(VIEW_TYPE_MDZ).forEach((l) => candidates.push(l.view));
+    for (const view of candidates) {
+      if (view instanceof MdzView && view.file?.path === sourcePath) return view;
+    }
+    return null;
+  }
+
+  /** Keep the archive catalog and graph hooks current as the vault and workspace change. */
+  private registerArchiveIndexing(): void {
+    const { vault, metadataCache, workspace } = this.app;
+    this.registerEvent(vault.on('create', (f) => this.catalog.onFileChanged(f)));
+    this.registerEvent(vault.on('modify', (f) => this.catalog.onFileChanged(f)));
+    this.registerEvent(vault.on('delete', (f) => this.catalog.onFileDeleted(f)));
+    this.registerEvent(vault.on('rename', (f, oldPath) => this.catalog.onFileRenamed(f, oldPath)));
+    this.registerEvent(metadataCache.on('changed', (f, _data, cache) => void this.catalog.onMetadataChanged(f, cache)));
+    this.registerEvent(workspace.on('layout-change', () => this.graph.hookAll()));
+    this.registerEvent(workspace.on('active-leaf-change', () => this.graph.hookAll(true)));
+    // Custom event from MdzView when it switches documents within an archive.
+    this.registerEvent(
+      (workspace as unknown as { on(name: string, cb: () => void): ReturnType<typeof workspace.on> }).on(
+        'mdzip:document-open',
+        () => this.graph.hookAll(true)
+      )
+    );
+    workspace.onLayoutReady(() => {
+      void this.catalog.build().then(() => this.graph.refresh());
+    });
+  }
+
+  /**
+   * Graph node to focus: the document open in the active MDZip view, when
+   * the graph is global or local to that archive.
+   */
+  private graphFocus(localFile: string | null): string | null {
+    const view = this.app.workspace.getActiveViewOfType(MdzView);
+    const path = view?.file?.path;
+    if (!view || !path || (localFile !== null && localFile !== path)) return null;
+    return nodeId(path, view.getCurrentDocument(), view.getEntryPoint());
+  }
+
+  /** Current incoming/outgoing links between archive documents and notes. */
+  private async linkIndex() {
+    return buildLinkIndex(
+      await this.catalog.summaries(),
+      this.catalog.noteToArchiveLinks(),
+      this.app.metadataCache.resolvedLinks
+    );
+  }
+
+  private refreshLinksViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MDZ_LINKS)) {
+      if (leaf.view instanceof MdzLinksView) leaf.view.refresh();
+    }
+  }
+
+  /** Show the MDZip links panel in the right sidebar. */
+  async openLinksPanel(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(VIEW_TYPE_MDZ_LINKS)[0];
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false) ?? workspace.getLeaf('split');
+      await leaf.setViewState({ type: VIEW_TYPE_MDZ_LINKS, active: false });
+    }
+    await workspace.revealLeaf(leaf);
+    await leaf.loadIfDeferred();
+  }
+
+  /** Show the MDZip search view in the left sidebar and focus its query box. */
+  private async openSearch(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(VIEW_TYPE_MDZ_SEARCH)[0];
+    if (!leaf) {
+      leaf = workspace.getLeftLeaf(false) ?? workspace.getLeaf(true);
+      await leaf.setViewState({ type: VIEW_TYPE_MDZ_SEARCH, active: true });
+    }
+    await workspace.revealLeaf(leaf);
+    await leaf.loadIfDeferred();
+    const selection = workspace.activeEditor?.editor?.getSelection()?.trim();
+    if (leaf.view instanceof MdzSearchView) leaf.view.focusQuery(selection || undefined);
+  }
+
+  /** The live entry index of an archive that's open in a view, if any. */
+  private openArchiveIndex(path: string): ArchiveIndex | null {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MDZ)) {
+      const view = leaf.view;
+      if (view instanceof MdzView && view.file?.path === path) {
+        const index = view.archiveIndex();
+        if (index) return index;
+      }
+    }
+    return null;
   }
 
   // ---- Commands ----
@@ -427,5 +637,19 @@ function toMdzViewState(viewState: ViewState): ViewState {
 declare module 'obsidian' {
   interface WorkspaceLeaf {
     openLinkText(linktext: string, sourcePath: string, openViewState?: OpenViewState): Promise<void>;
+  }
+}
+
+/** Notice text for a link that doesn't resolve. */
+function unresolvedMessage(link: string, reason: string): string {
+  switch (reason) {
+    case 'no-host-location':
+      return `"${link}" points outside this archive, which has no location in the vault.`;
+    case 'nested-archive':
+      return `"${link}" goes into an archive inside another archive, which isn't supported.`;
+    case 'invalid':
+      return `"${link}" isn't a valid link path.`;
+    default:
+      return `Can't find "${link}".`;
   }
 }

@@ -6,13 +6,14 @@ import {
   MarkdownView,
   Notice,
   PaneType,
-  parseLinktext,
   TFile,
   ViewStateResult,
   WorkspaceLeaf,
 } from 'obsidian';
 import { MdzArchiveCore } from '@mdzip/core-js';
 import { blockPadding, dropPosition, imageExtension, imageFiles, safeFileStem } from './images';
+import type { LinkTarget } from './links';
+import { ArchiveIndex, indexOf, VaultLinks } from './vault-links';
 
 export const VIEW_TYPE_MDZ = 'mdz-document';
 
@@ -81,9 +82,13 @@ export class MdzView extends MarkdownView {
   private resolveScheduled = false;
   /** Bumped whenever the archive changes; resolved images record the generation they point at. */
   private archiveGeneration = 0;
+  /** Entry index for link resolution, rebuilt when the archive changes. */
+  private entryIndex: { generation: number; index: ArchiveIndex } | null = null;
+  private links: VaultLinks;
 
-  constructor(leaf: WorkspaceLeaf) {
+  constructor(leaf: WorkspaceLeaf, links: VaultLinks) {
     super(leaf);
+    this.links = links;
     // TextFileView autosaves 2s after each change. For large archives that
     // means rewriting a big file constantly, so wait longer; Mod+S, closing
     // the tab and quitting still save immediately.
@@ -167,6 +172,13 @@ export class MdzView extends MarkdownView {
     // link handling, so follow the ones that point into the archive here.
     this.registerDomEvent(this.contentEl, 'click', (evt) => this.followHtmlLink(evt), { capture: true });
     this.registerDomEvent(this.contentEl, 'auxclick', (evt) => this.followHtmlLink(evt), { capture: true });
+
+    // Header action: the MDZip links panel (incoming/outgoing links for this document).
+    this.addAction('package-open', 'Show links for this document', () => {
+      (this.app as unknown as { commands: { executeCommandById(id: string): boolean } }).commands.executeCommandById(
+        'mdzip-obsidian:show-links'
+      );
+    });
 
     // Large archives may be holding unsaved edits for a while; flush them on quit.
     this.registerEvent(this.app.workspace.on('quit', (tasks) => tasks.add(() => this.save())));
@@ -282,40 +294,35 @@ export class MdzView extends MarkdownView {
       .map((e) => e.path);
   }
 
+  /** This archive's entries and entry point, for link resolution. */
+  archiveIndex(): ArchiveIndex | null {
+    if (!this.archive) return null;
+    if (this.entryIndex?.generation !== this.archiveGeneration) {
+      const entries = this.archive
+        .listEntries()
+        .filter((e) => !e.isDirectory)
+        .map((e) => e.path);
+      this.entryIndex = { generation: this.archiveGeneration, index: indexOf(entries, this.entryPointPath) };
+    }
+    return this.entryIndex.index;
+  }
+
   /**
-   * The archive path of a link target, if it's a Markdown document in this
-   * archive. Tries the link relative to the current document, then from the
-   * archive root, with and without a `.md` extension, then (for bare
-   * wikilink names) a unique file-name match.
+   * Resolve a link written in the current document: spec Sections 9.3–9.5,
+   * plus name lookup within the archive for wikilinks (Section 9.7).
    */
-  resolveDocumentLink(linkpath: string): string | null {
-    const archive = this.archive;
-    if (!archive || !linkpath) return null;
-    let decoded = linkpath;
-    try {
-      decoded = decodeURIComponent(linkpath);
-    } catch {
-      // Not URI-encoded; use as-is.
+  resolveLink(link: string): Promise<LinkTarget> {
+    if (!this.file) return Promise.resolve({ kind: 'unresolved', reason: 'not-found' });
+    return this.links.resolveInArchive(this.file.path, this.currentDoc, link, this.cachedDocuments());
+  }
+
+  private docsCache: { generation: number; docs: string[] } | null = null;
+
+  private cachedDocuments(): string[] {
+    if (this.docsCache?.generation !== this.archiveGeneration) {
+      this.docsCache = { generation: this.archiveGeneration, docs: this.listDocuments() };
     }
-    const names = /\.[^/.]+$/.test(decoded) ? [decoded] : [decoded, `${decoded}.md`];
-    const isDocument = (path: string) => {
-      const entry = archive.findEntry(path) as ZipEntryLike | null;
-      return !!entry && !entry.dir && MdzArchiveCore.isMarkdownFile(path);
-    };
-    for (const name of names) {
-      const relative = MdzArchiveCore.resolvePath(this.currentDoc, name);
-      if (isDocument(relative)) return relative;
-      const fromRoot = MdzArchiveCore.normalizePath(name.replace(/^\/+/, ''));
-      if (isDocument(fromRoot)) return fromRoot;
-    }
-    if (!decoded.includes('/')) {
-      const wanted = names.map((n) => n.toLowerCase());
-      const matches = this.listDocuments().filter((p) =>
-        wanted.includes((p.split('/').pop() ?? '').toLowerCase())
-      );
-      if (matches.length === 1) return matches[0];
-    }
-    return null;
+    return this.docsCache.docs;
   }
 
   /**
@@ -339,13 +346,15 @@ export class MdzView extends MarkdownView {
     const a = (evt.target as HTMLElement | null)?.closest?.('a[href]');
     if (!a || a.hasClass('internal-link') || a.hasClass('external-link')) return;
     const href = a.getAttribute('href') ?? '';
-    if (!href || href.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) return;
-    const { path, subpath } = parseLinktext(href);
-    const target = this.resolveDocumentLink(path);
-    if (!target) return;
+    if (!this.file || !href || href.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) {
+      return;
+    }
+    // A relative href: resolve it like any other link from this document
+    // (the plugin's openLinkText handling), rather than letting the browser
+    // navigate the window.
     evt.preventDefault();
     evt.stopPropagation();
-    void this.openDocument(target, evt.button === 1 ? 'tab' : modPaneType(evt), subpath || undefined);
+    void this.app.workspace.openLinkText(href, this.file.path, evt.button === 1 ? 'tab' : modPaneType(evt));
   }
 
   /** Save the current document, then switch the editor to `path`. */
@@ -366,8 +375,10 @@ export class MdzView extends MarkdownView {
       this.data = markdown;
       this.setViewData(markdown, true);
       this.updateDocumentUi();
-      // Lets the word count (and similar) pick up the new document.
+      // Lets the word count (and similar) pick up the new document, and the
+      // graph move its focus to it.
       this.app.workspace.trigger('quick-preview', file, markdown);
+      this.app.workspace.trigger('mdzip:document-open', this);
       shown = true;
     });
     return shown;
@@ -553,6 +564,11 @@ export class MdzView extends MarkdownView {
     return this.currentDoc;
   }
 
+  /** Archive path of the archive's entry point. */
+  getEntryPoint(): string {
+    return this.entryPointPath;
+  }
+
   // ---- Archive images ----
 
   /**
@@ -564,7 +580,7 @@ export class MdzView extends MarkdownView {
     this.archive = archive;
     this.savedDocs.clear();
     for (const pending of this.imageUrls.values()) {
-      void pending.then((url) => url && URL.revokeObjectURL(url));
+      void pending.then((url) => url?.startsWith('blob:') && URL.revokeObjectURL(url));
     }
     this.imageUrls.clear();
     this.archiveGeneration++;
@@ -591,13 +607,18 @@ export class MdzView extends MarkdownView {
     if (!archive) return;
     const generation = String(this.archiveGeneration);
 
-    // Links to documents in the archive aren't in the vault, so Obsidian
-    // fades them as unresolved; they do resolve (see followArchiveLinks).
-    this.contentEl.querySelectorAll<HTMLElement>('a.internal-link.is-unresolved[data-href]').forEach((a) => {
-      if (this.resolveDocumentLink(parseLinktext(a.getAttribute('data-href') ?? '').path)) {
-        a.removeClass('is-unresolved');
-      }
-    });
+    // Obsidian resolves links against the vault, so it fades links to
+    // documents in the archive, or outside it, as unresolved. Un-fade the
+    // ones that do resolve (see followArchiveLinks in main.ts).
+    for (const a of Array.from(
+      this.contentEl.querySelectorAll<HTMLElement>('a.internal-link.is-unresolved[data-href]')
+    )) {
+      if (a.getAttribute('data-mdz-link-gen') === generation) continue;
+      a.setAttribute('data-mdz-link-gen', generation);
+      const target = await this.resolveLink(a.getAttribute('data-href') ?? '');
+      if (archive !== this.archive) return;
+      if (target.kind !== 'unresolved') a.removeClass('is-unresolved');
+    }
 
     // Claim new candidates, remembering the path they referenced.
     this.contentEl
@@ -637,22 +658,30 @@ export class MdzView extends MarkdownView {
     }
   }
 
-  /** Blob URL for an archive image referenced from the current document, or null. */
+  /**
+   * URL for an image referenced from the current document, or null: a blob
+   * URL for an image inside the archive, or the vault resource URL for one
+   * next to the archive (`../logo.png`, spec Section 9.4). Images inside
+   * other archives aren't loaded.
+   */
   private imageUrl(archive: MdzArchiveCore, src: string): Promise<string | null> {
     // Only read from the current archive, so every URL lands in the cache
     // and is revoked when the archive changes.
     if (archive !== this.archive) return Promise.resolve(null);
-    let ref = src.split('|')[0].split('#')[0];
-    try {
-      ref = decodeURIComponent(ref);
-    } catch {
-      // Not URI-encoded; use as-is.
-    }
-    const path = MdzArchiveCore.resolvePath(this.currentDoc, ref);
-    let pending = this.imageUrls.get(path);
+    const ref = src.split('|')[0];
+    const key = `${this.currentDoc}\u0000${ref}`;
+    let pending = this.imageUrls.get(key);
     if (!pending) {
-      pending = readImage(archive, path);
-      this.imageUrls.set(path, pending);
+      pending = this.resolveLink(ref).then((target) => {
+        if (target.kind === 'internal') return readImage(archive, target.entry);
+        if (target.kind === 'host') {
+          const file = this.links.vaultFile(target.path);
+          const isImage = file && MdzArchiveCore.IMAGE_MIME_TYPES[file.extension.toLowerCase()];
+          return isImage ? this.app.vault.getResourcePath(file) : null;
+        }
+        return null;
+      });
+      this.imageUrls.set(key, pending);
     }
     return pending;
   }
