@@ -6,14 +6,17 @@ import {
   MarkdownView,
   Notice,
   PaneType,
+  setTooltip,
   TFile,
   ViewStateResult,
   WorkspaceLeaf,
 } from 'obsidian';
 import { MdzArchiveCore } from '@mdzip/core-js';
 import { blockPadding, dropPosition, imageExtension, imageFiles, safeFileStem } from './images';
-import type { LinkTarget } from './links';
+import type { LinkTarget, LinkUse } from './links';
 import { ArchiveIndex, indexOf, VaultLinks } from './vault-links';
+import type { ImageInsertMode } from './image-format';
+import { imageMarkup } from './image-insert-modal';
 
 export const VIEW_TYPE_MDZ = 'mdz-document';
 
@@ -75,8 +78,8 @@ export class MdzView extends MarkdownView {
   /** Serializes archive writes so saves and image inserts never interleave. */
   private writeQueue: Promise<void> = Promise.resolve();
   private errorEl: HTMLElement | null = null;
-  private docBarEl: HTMLElement | null = null;
-  private documentsAction: HTMLElement | null = null;
+  /** The current document's path, shown after the archive's name in the view header. */
+  private headerDocEl: HTMLElement | null = null;
   /** Blob URL lookups for the current archive, keyed by archive path (cached as promises so concurrent passes share one URL). */
   private imageUrls = new Map<string, Promise<string | null>>();
   private resolveScheduled = false;
@@ -86,7 +89,12 @@ export class MdzView extends MarkdownView {
   private entryIndex: { generation: number; index: ArchiveIndex } | null = null;
   private links: VaultLinks;
 
-  constructor(leaf: WorkspaceLeaf, links: VaultLinks) {
+  constructor(
+    leaf: WorkspaceLeaf,
+    links: VaultLinks,
+    /** The "Images pasted into archives" setting. */
+    private imageMode: () => ImageInsertMode = () => 'markdown'
+  ) {
     super(leaf);
     this.links = links;
     // TextFileView autosaves 2s after each change. For large archives that
@@ -173,7 +181,12 @@ export class MdzView extends MarkdownView {
     this.registerDomEvent(this.contentEl, 'click', (evt) => this.followHtmlLink(evt), { capture: true });
     this.registerDomEvent(this.contentEl, 'auxclick', (evt) => this.followHtmlLink(evt), { capture: true });
 
-    // Header action: the MDZip links panel (incoming/outgoing links for this document).
+    // Header actions: the archive's contents and the Archive links panel.
+    this.addAction('folder-tree', 'Show archive contents', () => {
+      (this.app as unknown as { commands: { executeCommandById(id: string): boolean } }).commands.executeCommandById(
+        'mdzip-obsidian:show-contents'
+      );
+    });
     this.addAction('package-open', 'Show links for this document', () => {
       (this.app as unknown as { commands: { executeCommandById(id: string): boolean } }).commands.executeCommandById(
         'mdzip-obsidian:show-links'
@@ -221,6 +234,31 @@ export class MdzView extends MarkdownView {
       this.showError(err instanceof Error ? err.message : String(err));
     }
     this.updateDocumentUi();
+  }
+
+  /**
+   * Obsidian pushes a view's text into every other view of the same file, so
+   * panes showing one note stay in sync while typing. Two tabs on one archive
+   * can show different documents, though: taking the other tab's text here
+   * would later save it under this tab's document and overwrite it. So only
+   * accept text from a tab showing the same document of the same archive.
+   */
+  onExternalDataChange(file: TFile, data: string): void {
+    if (file !== this.file) return;
+    const sameDocument = this.app.workspace
+      .getLeavesOfType(VIEW_TYPE_MDZ)
+      .some(
+        (leaf) =>
+          leaf.view !== this &&
+          leaf.view instanceof MdzView &&
+          leaf.view.file === file &&
+          leaf.view.currentDoc === this.currentDoc &&
+          leaf.view.getViewData() === data
+      );
+    if (!sameDocument) return;
+    const inherited = (Object.getPrototypeOf(MdzView.prototype) as { onExternalDataChange?: (f: TFile, d: string) => void })
+      .onExternalDataChange;
+    inherited?.call(this, file, data);
   }
 
   /** Re-load when the underlying file changes on disk (e.g. external edit). */
@@ -311,9 +349,9 @@ export class MdzView extends MarkdownView {
    * Resolve a link written in the current document: spec Sections 9.3–9.5,
    * plus name lookup within the archive for wikilinks (Section 9.7).
    */
-  resolveLink(link: string): Promise<LinkTarget> {
+  resolveLink(link: string, use: LinkUse = 'navigate'): Promise<LinkTarget> {
     if (!this.file) return Promise.resolve({ kind: 'unresolved', reason: 'not-found' });
-    return this.links.resolveInArchive(this.file.path, this.currentDoc, link, this.cachedDocuments());
+    return this.links.resolveInArchive(this.file.path, this.currentDoc, link, this.cachedDocuments(), use);
   }
 
   private docsCache: { generation: number; docs: string[] } | null = null;
@@ -399,41 +437,38 @@ export class MdzView extends MarkdownView {
     }).open();
   }
 
-  /** Document bar and header action: shown for project archives, or when off the entry point. */
+  /**
+   * Show the current document after the archive's name in the view header,
+   * continuing Obsidian's breadcrumb: "Projects / Alpha Handbook / guide / setup".
+   * Shown for project archives, and in document mode when off the entry point.
+   * Folder parts open the Archive contents pane. Kept out of the (editable)
+   * title, which renames the file.
+   */
   private updateDocumentUi(): void {
+    this.headerDocEl?.remove();
+    this.headerDocEl = null;
+    const container = (this as unknown as { titleContainerEl?: HTMLElement }).titleContainerEl;
     const show = !!this.archive && (this.isProject || this.currentDoc !== this.entryPointPath);
+    if (!container || !show) return;
 
-    if (this.isProject && !this.documentsAction) {
-      this.documentsAction = this.addAction('files', 'Documents in this archive', () => this.chooseDocument());
-    } else if (!this.isProject && this.documentsAction) {
-      this.documentsAction.remove();
-      this.documentsAction = null;
-    }
-
-    if (!show) {
-      this.docBarEl?.remove();
-      this.docBarEl = null;
-      return;
-    }
-    if (!this.docBarEl) {
-      this.docBarEl = createDiv({ cls: 'mdz-docbar' });
-    }
-    this.docBarEl.empty();
-    const pathEl = this.docBarEl.createDiv({ cls: 'mdz-docbar-path' });
+    const el = createSpan({ cls: 'mdz-header-doc' });
     const parts = this.currentDoc.split('/');
     parts.forEach((part, i) => {
-      if (i > 0) pathEl.createSpan({ cls: 'mdz-docbar-sep', text: '/' });
-      pathEl.createSpan({ cls: i === parts.length - 1 ? 'mdz-docbar-name' : 'mdz-docbar-dir', text: part });
+      el.createSpan({ cls: 'view-header-breadcrumb-separator', text: '/' });
+      if (i === parts.length - 1) {
+        el.createSpan({ cls: 'mdz-header-doc-name', text: part.replace(/\.(md|markdown)$/i, '') });
+      } else {
+        const crumb = el.createSpan({ cls: 'view-header-breadcrumb', text: part });
+        crumb.addEventListener('click', () => {
+          (this.app as unknown as { commands: { executeCommandById(id: string): boolean } }).commands.executeCommandById(
+            'mdzip-obsidian:show-contents'
+          );
+        });
+      }
     });
-    pathEl.setAttribute('title', this.currentDoc);
-    if (this.currentDoc !== this.entryPointPath) {
-      const home = this.docBarEl.createEl('button', { cls: 'mdz-docbar-btn', text: 'Entry point' });
-      home.addEventListener('click', () => void this.openDocument(this.entryPointPath));
-    }
-    const pick = this.docBarEl.createEl('button', { cls: 'mdz-docbar-btn', text: 'Documents…' });
-    pick.addEventListener('click', () => this.chooseDocument());
-    if (this.errorEl) this.errorEl.after(this.docBarEl);
-    else this.contentEl.prepend(this.docBarEl);
+    setTooltip(el, `${this.currentDoc} — a document inside ${this.file?.name ?? 'this archive'}`, { placement: 'bottom' });
+    container.appendChild(el);
+    this.headerDocEl = el;
   }
 
   // ---- Saving ----
@@ -519,6 +554,11 @@ export class MdzView extends MarkdownView {
       return;
     }
 
+    // Where the images go, taken now: the size and alignment dialog may move focus.
+    const dropOffset = evt ? dropPosition(editor, evt) : null;
+    const from = dropOffset !== null ? editor.offsetToPos(dropOffset) : editor.getCursor('from');
+    const to = dropOffset !== null ? from : editor.getCursor('to');
+
     const baseDir = this.currentDoc.includes('/')
       ? this.currentDoc.slice(0, this.currentDoc.lastIndexOf('/') + 1)
       : '';
@@ -533,16 +573,15 @@ export class MdzView extends MarkdownView {
       for (let n = 1; taken.has(relPath.toLowerCase()) || archive.findEntry(baseDir + relPath); n++) {
         relPath = `images/${stem}-${n}.${ext}`;
       }
+      const alt = source === 'paste' ? 'Pasted image' : stem;
+      const markup = await imageMarkup(this.app, this.imageMode(), relPath, image, alt);
+      if (markup === null) continue; // Cancelled in the dialog: leave this image out.
       taken.add(relPath.toLowerCase());
       assets.push({ path: baseDir + relPath, bytes: new Uint8Array(await image.arrayBuffer()) });
-      const alt = source === 'paste' ? 'Pasted image' : stem;
-      links.push(`![${alt}](${relPath})`);
+      links.push(markup);
     }
-    if (this.file !== file) return;
+    if (this.file !== file || !links.length) return;
 
-    const dropOffset = evt ? dropPosition(editor, evt) : null;
-    const from = dropOffset !== null ? editor.offsetToPos(dropOffset) : editor.getCursor('from');
-    const to = dropOffset !== null ? from : editor.getCursor('to');
     const { before, after } = blockPadding(editor, from, to);
     const separator = before || after ? '\n\n' : '\n';
     const inserted = before + links.join(separator) + after;
@@ -569,6 +608,63 @@ export class MdzView extends MarkdownView {
     return this.entryPointPath;
   }
 
+  /** The archive's interpretation mode (spec Section 5.7). */
+  getArchiveMode(): 'document' | 'project' {
+    return this.isProject ? 'project' : 'document';
+  }
+
+  /** Increases whenever the archive's contents change (load, save, reload from disk). */
+  getArchiveGeneration(): number {
+    return this.archiveGeneration;
+  }
+
+  /** Every entry of the archive, for the contents pane. */
+  listArchiveEntries(): { path: string; isMarkdown: boolean; isImage: boolean; isDirectory: boolean; size?: number }[] {
+    return this.archive ? this.archive.listEntries() : [];
+  }
+
+  /** Text of an archive entry (including unsaved edits to documents), or null. */
+  readArchiveText(path: string): Promise<string | null> {
+    return this.readDoc(path);
+  }
+
+  /**
+   * Change the archive through this view's write queue, so it can't race the
+   * view's own saves: the current document's edits are saved first, then
+   * `change` gets the archive bytes and returns the new bytes, which are
+   * written to the file and reloaded here.
+   */
+  async modifyArchive(change: (bytes: ArrayBuffer) => Promise<ArrayBuffer>): Promise<void> {
+    const file = this.file;
+    if (!file) throw new Error('No archive is open.');
+    let failure: unknown = null;
+    await this.enqueue(async () => {
+      if (this.file !== file) return;
+      await this.writeArchive(file, []);
+      if (!this.archiveBytes) {
+        failure = new Error(`${file.name} couldn't be read.`);
+        return;
+      }
+      try {
+        const bytes = await change(this.archiveBytes);
+        const opened = await openArchive(bytes);
+        await this.app.vault.modifyBinary(file, bytes);
+        this.isProject = opened.mode === 'project';
+        this.entryPointPath = opened.entryPointPath;
+        this.setArchive(bytes, opened.archive);
+        this.updateDocumentUi();
+      } catch (err) {
+        failure = err;
+      }
+    });
+    if (failure) throw failure;
+  }
+
+  /** Blob URL for an image entry, or null. The caller revokes it when done. */
+  archiveImageUrl(path: string): Promise<string | null> {
+    return this.archive ? readImage(this.archive, path) : Promise.resolve(null);
+  }
+
   // ---- Archive images ----
 
   /**
@@ -585,6 +681,7 @@ export class MdzView extends MarkdownView {
     this.imageUrls.clear();
     this.archiveGeneration++;
     this.scheduleImageResolve();
+    this.app.workspace.trigger('mdzip:archive-changed', this);
   }
 
   private scheduleImageResolve(): void {
@@ -660,9 +757,10 @@ export class MdzView extends MarkdownView {
 
   /**
    * URL for an image referenced from the current document, or null: a blob
-   * URL for an image inside the archive, or the vault resource URL for one
-   * next to the archive (`../logo.png`, spec Section 9.4). Images inside
-   * other archives aren't loaded.
+   * URL for an image inside the archive, or — only when the "Show vault
+   * images linked from archives" setting is on — the vault resource URL for
+   * one next to the archive (`../logo.png`, spec Sections 9.4 and 9.6).
+   * Images inside other archives aren't loaded.
    */
   private imageUrl(archive: MdzArchiveCore, src: string): Promise<string | null> {
     // Only read from the current archive, so every URL lands in the cache
@@ -672,7 +770,7 @@ export class MdzView extends MarkdownView {
     const key = `${this.currentDoc}\u0000${ref}`;
     let pending = this.imageUrls.get(key);
     if (!pending) {
-      pending = this.resolveLink(ref).then((target) => {
+      pending = this.resolveLink(ref, 'embed').then((target) => {
         if (target.kind === 'internal') return readImage(archive, target.entry);
         if (target.kind === 'host') {
           const file = this.links.vaultFile(target.path);

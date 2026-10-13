@@ -5,7 +5,10 @@
 // Kept free of Obsidian imports so it can be tested against the spec's
 // examples/fixtures/link-resolution-cases.json (see test/links.test.ts).
 
-export type UnresolvedReason = 'not-found' | 'invalid' | 'unsupported' | 'no-host-location' | 'nested-archive';
+export type UnresolvedReason = 'not-found' | 'invalid' | 'unsupported' | 'no-host-location' | 'nested-archive' | 'denied';
+
+/** `navigate`: a link the user follows. `embed`: a resource the document loads automatically (Section 9.6). */
+export type LinkUse = 'navigate' | 'embed';
 
 export type LinkTarget =
   /** An entry of the archive the link is in. */
@@ -34,6 +37,24 @@ export interface LinkHost {
   outsideLinks?: boolean;
   /** Whether links into archives are supported (Section 9.5). Default true. */
   intoArchiveLinks?: boolean;
+  /**
+   * The trust boundary (Section 9.6): host targets outside it are denied.
+   * `''` (the default) trusts the whole host, as for an Obsidian vault;
+   * `null` means no trusted location at all.
+   */
+  trustRoot?: string | null;
+  /** Host paths outside the boundary that the user explicitly allowed. */
+  allowedPaths?: string[];
+  /** Whether embeds may load resources from outside an archive (inside the boundary only). Default false. */
+  loadOutsideResources?: boolean;
+}
+
+/** Whether a host path is inside the trust boundary or explicitly allowed (Section 9.6). */
+function permitted(host: LinkHost, path: string): boolean {
+  if (host.allowedPaths?.includes(path)) return true;
+  const root = host.trustRoot === undefined ? '' : host.trustRoot;
+  if (root === null) return false;
+  return root === '' || path === root || path.startsWith(`${root.replace(/\/+$/, '')}/`);
 }
 
 const SCHEME = /^[a-z][a-z0-9+.-]*:/i;
@@ -51,19 +72,20 @@ function dirSegments(path: string): string[] {
 
 /**
  * Split a destination into decoded segments (Section 9.3 steps 3–4), or null
- * if it isn't a valid relative link. Decoding is lenient about malformed
- * `%` sequences, since Obsidian hands over link text that may already be
- * decoded (for example `100% done.md`).
+ * if it isn't a valid relative link. Each segment is decoded exactly once;
+ * malformed `%` sequences and non-UTF-8 bytes make the link invalid. (Link
+ * text Obsidian hands over already decoded, such as `[[100% done]]`, is
+ * retried by `VaultLinks.resolveInArchive`.)
  */
 function segmentsOf(dest: string): string[] | null {
   if (dest.startsWith('/') || dest.includes('\\')) return null;
   const segs: string[] = [];
   for (const raw of dest.split('/')) {
-    let s = raw;
+    let s: string;
     try {
       s = decodeURIComponent(raw);
     } catch {
-      // Not valid percent-encoding: use the text as written.
+      return null;
     }
     if (BAD_SEGMENT.test(s)) return null;
     segs.push(s);
@@ -71,8 +93,17 @@ function segmentsOf(dest: string): string[] | null {
   return segs;
 }
 
-/** Resolve `link` written in `from`, following Sections 9.3–9.5. */
-export async function resolveLink(from: LinkSource, link: string, host: LinkHost): Promise<LinkTarget> {
+/**
+ * Resolve `link` written in `from`, following Sections 9.3–9.6. Host targets
+ * outside the trust boundary are `denied` whether or not they exist; embeds
+ * that leave an archive are `denied` unless `host.loadOutsideResources`.
+ */
+export async function resolveLink(
+  from: LinkSource,
+  link: string,
+  host: LinkHost,
+  use: LinkUse = 'navigate'
+): Promise<LinkTarget> {
   if (SCHEME.test(link)) return { kind: 'url' };
 
   const hashAt = link.indexOf('#');
@@ -120,6 +151,7 @@ export async function resolveLink(from: LinkSource, link: string, host: LinkHost
     // Left the archive (Section 9.4): continue from the directory containing it.
     if (host.outsideLinks === false) return { kind: 'unresolved', reason: 'unsupported' };
     if (host.hostLocation === false) return { kind: 'unresolved', reason: 'no-host-location' };
+    if (use === 'embed' && !host.loadOutsideResources) return { kind: 'unresolved', reason: 'denied' };
     stack = dirSegments(from.archive);
   } else {
     stack = dirSegments(from.host);
@@ -136,13 +168,17 @@ export async function resolveLink(from: LinkSource, link: string, host: LinkHost
     }
     stack.push(s);
     const hostPath = stack.join('/');
-    if (isMdzName(s) && host.kind(hostPath) === 'archive') {
+    if (isMdzName(s) && permitted(host, hostPath) && host.kind(hostPath) === 'archive') {
       if (host.intoArchiveLinks === false) return { kind: 'unresolved', reason: 'unsupported' };
+      const otherArchive = 'archive' in from && hostPath !== from.archive;
+      if (otherArchive && use === 'embed' && !host.loadOutsideResources) return { kind: 'unresolved', reason: 'denied' };
       return resolveInsideArchive(hostPath, segs.slice(i + 1), host, withFragment);
     }
   }
 
   const hostPath = stack.join('/');
+  // Checked before existence, so a link can't probe for files outside the boundary.
+  if (!permitted(host, hostPath)) return { kind: 'unresolved', reason: 'denied' };
   return host.kind(hostPath) === 'file'
     ? withFragment({ kind: 'host', path: hostPath })
     : { kind: 'unresolved', reason: 'not-found' };

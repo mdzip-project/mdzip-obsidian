@@ -35,7 +35,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 WORKSPACE = REPO.parent
 sys.path.insert(0, str(WORKSPACE / "mdzip-core-python" / "src"))
-import mdzip  # noqa: E402
+import mdzip_core  # noqa: E402
 
 MARKER = ".mdzip-test-vault"
 
@@ -241,23 +241,28 @@ Each item says where to look. Tick them off as you go. (Re-run
 - [ ] Word count in the status bar matches the document, not the ZIP size.
 
 ## Projects and documents
-- [ ] Open [[Projects/Alpha Handbook.mdz|Alpha Handbook]]: document bar, *Documents…*, header icons.
+- [ ] Open [[Projects/Alpha Handbook.mdz|Alpha Handbook]]: the header reads `Projects / Alpha Handbook / index`; two header icons (archive contents, links); no button bar in the note. *MDZip: Open document in archive* lists the documents.
 - [ ] Follow links between its documents; back/forward works; Ctrl-click opens a new tab.
 - [ ] Inside it, `[[setup]]` (a wikilink by name) opens `guide/setup.md`.
 - [ ] Restart Obsidian: tabs reopen on the same document.
+- [ ] *Archive contents* pane (folder-tree icon in the tab header, or *MDZip: Show archive contents*): the archive's tree in its own section below Files (both visible), entry point first with a house icon, current document highlighted, `manifest` dimmed. Clicking a document opens it; clicking `logo` or `manifest` shows a preview; right-click offers *Open in new tab*, *Copy path* and *Copy link for a note next to the archive*.
+- [ ] In the *Archive contents* pane, **+** → *Add README.md* on the Field Guide: it's added, opens for editing, and the Field Guide still opens on `index.md`. **+** again shows *Open README.md*.
+- [ ] Right-click a `.mdz` in Files: *Add README.md* / *Add AGENTS.md*. Right-click a note: *Convert to MDZip*.
+- [ ] Two tabs on Alpha Handbook showing different documents (Ctrl-click a link): type in one, then switch documents in the other. Neither document takes the other's text.
 
 ## Links across the archive boundary
-- [ ] From the Field Guide: `../../People/Ada Lovelace.md` opens the vault note; `![logo](../../Attachments/photo.png)` shows.
+- [ ] From the Field Guide: `../../People/Ada Lovelace.md` opens the vault note. `![logo](../../Attachments/photo.png)` stays hidden by default, and shows after turning on Settings → MDZip → "Show vault images linked from archives" (spec Section 9.6).
 - [ ] From the Field Guide: a link into `Projects/Alpha Handbook.mdz` opens that document.
 - [ ] From [[Home]]: every link under "Into archives" opens the right document; the missing one shows a notice and creates no note.
 - [ ] From [[Project Alpha]]: the shortest-name wikilink `[[Alpha Handbook.mdz]]` opens the archive.
 - [ ] From inside an archive, a missing link (`../Missing.md`) shows a notice; no stray note appears.
-- [ ] [Recipes](Recipes.mdz) opens on `recipes.md` (support files set aside); its `README.md` and `AGENTS.md` are listed in *Documents…*.
+- [ ] [Recipes](Recipes.mdz) opens on `recipes.md` (support files set aside); its `README.md` and `AGENTS.md` are listed (dimmed) in the *Archive contents* pane.
 - [ ] [Café Notes](<Archives/Café Notes.mdz>): links to `résumé.md` and `笔记/索引.md` open.
 
 ## Images
 - [ ] In an archive document, paste an image: saved inside the archive (`images/`), its own paragraph.
 - [ ] Drag an image file onto an archive document: same.
+- [ ] Settings → MDZip → *Images pasted into archives* → *Ask each time*, then paste: the Insert image dialog shows the image's size. Choose HTML, width 150, Center: it appears centered at 150 px, in live preview and reading view. *Wrap right* lets the text flow beside it. *Cancel* inserts nothing.
 - [ ] In [[Paste Here]], paste an image: the convert dialog appears; *Convert* turns it into `Paste Here.mdz`, copies `photo.png` in, updates links.
 - [ ] *Paste normally* saves to `Attachments/` as usual.
 
@@ -266,18 +271,19 @@ Each item says where to look. Tick them off as you go. (Re-run
 - [ ] Local graph with an archive document open: centred on that document.
 - [ ] *MDZip search* (ribbon): search `osprey` (Field Guide), `pancake` (Recipes), `lorem` (Library, many hits); results open at the line.
 - [ ] Core search for `quantum entanglement` finds nothing (it's inside `paper.pdf`, which core search doesn't index).
-- [ ] *MDZip links* panel on an archive document: incoming, outgoing, not found; on [[Ada Lovelace]]: "Linked from archives" lists the Field Guide.
+- [ ] *Archive links* panel on an archive document: incoming, outgoing, not found. On [[Ada Lovelace]]: an explanation line, then "Linked from archives" lists the Field Guide. On [[Linking]] (no archive links): one "No links to or from archives" line.
 
 ## Safety
 - [ ] Rename an archive in the file explorer: links to it from notes update (with "Automatically update internal links" on).
 - [ ] Turn the plugin off with an archive open, then on again: the tab returns to the MDZip view, archive unchanged.
+- [ ] Settings → MDZip → "Show vault images linked from archives" is off on a new install.
 """
 
 
 def archives() -> dict:
     """name → .mdz bytes (or raw bytes for the broken ones)."""
     out = {}
-    out["Archives/Field Guide.mdz"] = mdzip.create(
+    out["Archives/Field Guide.mdz"] = mdzip_core.create(
         {
             "index.md": """# Field Guide
 
@@ -313,7 +319,7 @@ Back to the [field guide](index.md).
         },
         title="Field Guide",
     )
-    out["Projects/Alpha Handbook.mdz"] = mdzip.create(
+    out["Projects/Alpha Handbook.mdz"] = mdzip_core.create(
         {
             "index.md": """# Alpha Handbook
 
@@ -345,7 +351,7 @@ Project-mode archive: several separate documents.
         z.writestr("README.md", "# About This Package\n\nThis is an MDZip (`.mdz`) package. Primary content starts at `recipes.md`.\n")
         z.writestr("AGENTS.md", "# AGENTS.md\n\nAn MDZip archive; the entry point is `recipes.md` (support files are set aside).\n")
     out["Recipes.mdz"] = buf.getvalue()
-    out["Archives/Café Notes.mdz"] = mdzip.create(
+    out["Archives/Café Notes.mdz"] = mdzip_core.create(
         {
             "index.md": "# Café Notes\n\n- [Résumé](r%C3%A9sum%C3%A9.md)\n- [笔记索引](%E7%AC%94%E8%AE%B0/%E7%B4%A2%E5%BC%95.md)\n- Angle brackets: [Résumé](<résumé.md>)\n",
             "résumé.md": "# Résumé\n\nAccented file name.\n",
@@ -363,7 +369,7 @@ Project-mode archive: several separate documents.
             f"[Library](../index.md)\n"
             + ("\nSee also [[Zettelkasten]].\n" if i % 25 == 0 else "")
         )
-    out["Archives/Library.mdz"] = mdzip.create(library, title="Library", mode="project", entry_point="index.md")
+    out["Archives/Library.mdz"] = mdzip_core.create(library, title="Library", mode="project", entry_point="index.md")
     out["Archives/Broken.mdz"] = b"This is not a ZIP file; the plugin should show an error, not raw bytes.\n"
     buf = __import__("io").BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:

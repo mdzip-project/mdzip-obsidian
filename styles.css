@@ -20,39 +20,35 @@
   color: var(--text-muted);
 }
 
-/* --- Document bar (project archives) ----------------------- */
-.mdz-docbar {
-  display: flex;
+/* --- Current document in the view header ------------------- */
+/* Continues Obsidian's breadcrumb after the archive's name. */
+.mdz-header-doc {
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 16px;
-  border-bottom: 1px solid var(--background-modifier-border);
-  font-size: var(--font-ui-small);
-  color: var(--text-muted);
-}
-
-.mdz-docbar-path {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.mdz-docbar-sep {
-  margin: 0 4px;
+.mdz-header-doc .view-header-breadcrumb-separator {
+  padding: 0 var(--size-4-1);
   color: var(--text-faint);
 }
 
-.mdz-docbar-name {
+.mdz-header-doc > .view-header-breadcrumb-separator:first-child {
+  /* The editable title before it already has padding. */
+  padding-inline-start: 0;
+}
+
+.mdz-header-doc .view-header-breadcrumb {
+  color: var(--text-muted);
+  cursor: var(--cursor);
+}
+
+.mdz-header-doc .view-header-breadcrumb:hover {
   color: var(--text-normal);
 }
 
-.mdz-docbar-btn {
-  flex-shrink: 0;
-  font-size: var(--font-ui-smaller);
-  padding: 2px 8px;
-  height: auto;
+.mdz-header-doc .mdz-header-doc-name {
+  color: var(--text-normal);
 }
 
 /* --- MDZip search view -------------------------------------- */
@@ -188,8 +184,101 @@
 }
 
 .mdz-links-none,
+.mdz-links-hint {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  padding: 0 6px var(--size-4-2);
+  line-height: var(--line-height-tight);
+}
+
 .mdz-links-empty {
   font-size: var(--font-ui-small);
   color: var(--text-faint);
   padding: 2px 6px;
+}
+
+/* --- Archive contents pane ----------------------------------- */
+/* The tree uses Obsidian's own file-explorer classes (tree-item, nav-folder,
+   nav-file, nav-file-tag), so it follows the user's theme. These rules only
+   add what the explorer doesn't have. */
+.mdz-contents {
+  padding: 0;
+}
+
+.mdz-contents-title {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+  padding: var(--size-4-1) var(--size-4-3) var(--size-4-2);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+}
+
+.mdz-contents-title-icon {
+  display: inline-flex;
+  color: var(--icon-color);
+}
+
+.mdz-contents-title-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.mdz-contents-title .mdz-contents-mode {
+  margin-inline-start: auto;
+  text-transform: lowercase;
+}
+
+.mdz-contents-tree {
+  padding: 0 var(--size-4-2) var(--size-4-3);
+}
+
+.mdz-contents-flag {
+  display: inline-flex;
+  align-items: center;
+  margin-inline-start: var(--size-4-1);
+  color: var(--text-muted);
+}
+
+.mdz-contents-flag svg {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+}
+
+.mdz-contents-muted .nav-file-title-content,
+.mdz-contents-unreferenced .nav-file-title-content {
+  color: var(--text-faint);
+}
+
+.mdz-contents-unreferenced .nav-file-title-content {
+  font-style: italic;
+}
+
+.mdz-contents-static {
+  cursor: default;
+}
+
+.mdz-preview-modal .mdz-preview-image {
+  display: block;
+  max-width: 100%;
+  max-height: 70vh;
+  margin: 0 auto;
+}
+
+.mdz-preview-modal .mdz-preview-text {
+  max-height: 70vh;
+  overflow: auto;
+  font-size: var(--font-ui-small);
+}
+
+/* --- Insert image dialog ----------------------------------- */
+.mdz-image-insert .mdz-image-size {
+  width: 6em;
+}
+
+.mdz-image-insert .mdz-field-disabled {
+  opacity: 0.5;
 }

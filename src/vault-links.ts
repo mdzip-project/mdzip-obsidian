@@ -1,5 +1,5 @@
 import { App, TFile, TFolder } from 'obsidian';
-import { isBareName, isMdzName, LinkHost, LinkSource, LinkTarget, matchDocumentName, resolveLink, samePath } from './links';
+import { isBareName, isMdzName, LinkHost, LinkSource, LinkTarget, LinkUse, matchDocumentName, resolveLink, samePath } from './links';
 
 /** What an archive contains, as far as link resolution needs to know. */
 export interface ArchiveIndex {
@@ -27,12 +27,14 @@ export class VaultLinks {
   constructor(
     private app: App,
     private openArchive: OpenArchiveLookup,
-    private readArchive: ArchiveReader
+    private readArchive: ArchiveReader,
+    /** Whether embeds may load vault files from outside an archive (spec Section 9.6). */
+    private loadOutsideResources: () => boolean = () => false
   ) {}
 
-  /** Resolve `link` written in `from`. */
-  resolve(from: LinkSource, link: string): Promise<LinkTarget> {
-    return resolveLink(from, link, this.host());
+  /** Resolve `link` written in `from`. `use` is 'embed' for images and other resources loaded automatically. */
+  resolve(from: LinkSource, link: string, use: LinkUse = 'navigate'): Promise<LinkTarget> {
+    return resolveLink(from, link, this.host(), use);
   }
 
   /**
@@ -65,16 +67,26 @@ export class VaultLinks {
    * result if none of those match, so callers can fall back to Obsidian's
    * vault-wide lookup for bare names.
    */
-  async resolveInArchive(archive: string, doc: string, link: string, docs: string[]): Promise<LinkTarget> {
+  async resolveInArchive(
+    archive: string,
+    doc: string,
+    link: string,
+    docs: string[],
+    use: LinkUse = 'navigate'
+  ): Promise<LinkTarget> {
     const from = { archive, path: doc };
-    const strict = await this.resolve(from, link);
+    let strict = await this.resolve(from, link, use);
+    if (strict.kind === 'unresolved' && strict.reason === 'invalid' && /%(?![0-9A-Fa-f]{2})/.test(link)) {
+      // Wikilinks aren't percent-encoded (Section 9.7): read a stray `%` as a literal one.
+      strict = await this.resolve(from, link.replace(/%(?![0-9A-Fa-f]{2})/g, '%25'), use);
+    }
     if (strict.kind !== 'unresolved' || strict.reason !== 'not-found') return strict;
 
     const hashAt = link.indexOf('#');
     const dest = hashAt >= 0 ? link.slice(0, hashAt) : link;
     const fragment = hashAt >= 0 ? link.slice(hashAt) : '';
     if (!/\.[^/.]+$/.test(dest)) {
-      const withMd = await this.resolve(from, `${dest}.md${fragment}`);
+      const withMd = await this.resolve(from, `${dest}.md${fragment}`, use);
       if (withMd.kind !== 'unresolved') return withMd;
     }
     if (isBareName(dest)) {
@@ -104,6 +116,9 @@ export class VaultLinks {
       },
       findEntry: async (archive, entry) => (await this.index(archive))?.findEntry(entry) ?? null,
       entryPoint: async (archive) => (await this.index(archive))?.entryPoint ?? null,
+      // The vault is the trust boundary; vault paths can't reach outside it anyway.
+      trustRoot: '',
+      loadOutsideResources: this.loadOutsideResources(),
     };
   }
 

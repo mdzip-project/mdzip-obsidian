@@ -34,7 +34,7 @@ export class MdzLinksView extends ItemView {
   }
 
   getDisplayText(): string {
-    return 'MDZip links';
+    return 'Archive links';
   }
 
   getIcon(): string {
@@ -94,14 +94,27 @@ export class MdzLinksView extends ItemView {
     const incoming = index.incoming(subject.id).filter((n) => subject.isArchiveDoc || isArchive(n));
     const outgoing = index.outgoing(subject.id).filter((n) => subject.isArchiveDoc || isArchive(n));
 
-    this.section(root, subject.isArchiveDoc ? 'Linked from' : 'Linked from archives', incoming, index);
-    this.section(root, subject.isArchiveDoc ? 'Links to' : 'Links into archives', outgoing, index);
-    if (subject.isArchiveDoc) {
-      const missing = index.unresolved(subject.id);
-      if (missing.length) {
-        const sec = this.header(root, 'Not found', missing.length);
-        for (const link of missing) sec.createDiv({ cls: 'mdz-links-item mdz-links-missing', text: link });
+    if (!subject.isArchiveDoc) {
+      // A regular note: only the links Obsidian's own panes can't see.
+      root.createDiv({
+        cls: 'mdz-links-hint',
+        text: "Links between this note and documents inside .mdz files. Links to other notes are in Obsidian's Backlinks and Outgoing links panes.",
+      });
+      if (!incoming.length && !outgoing.length) {
+        root.createDiv({ cls: 'mdz-links-none', text: 'No links to or from archives.' });
+        return;
       }
+      if (incoming.length) this.section(root, 'Linked from archives', incoming, index);
+      if (outgoing.length) this.section(root, 'Links into archives', outgoing, index);
+      return;
+    }
+
+    this.section(root, 'Linked from', incoming, index);
+    this.section(root, 'Links to', outgoing, index);
+    const missing = index.unresolved(subject.id);
+    if (missing.length) {
+      const sec = this.header(root, 'Not found', missing.length);
+      for (const link of missing) sec.createDiv({ cls: 'mdz-links-item mdz-links-missing', text: link });
     }
   }
 

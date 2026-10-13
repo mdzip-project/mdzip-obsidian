@@ -11,12 +11,20 @@ interface FixtureArchive {
   entryPoint: string;
 }
 interface Fixture {
-  host: { files: string[]; directories: string[]; archives: Record<string, FixtureArchive> };
+  host: { files: string[]; directories: string[]; archives: Record<string, FixtureArchive>; trustRoot?: string | null };
   cases: {
     name: string;
     from: LinkSource;
     link: string;
-    context?: { hostLocation?: boolean; outsideLinks?: boolean; intoArchiveLinks?: boolean };
+    use?: 'navigate' | 'embed';
+    context?: {
+      hostLocation?: boolean;
+      outsideLinks?: boolean;
+      intoArchiveLinks?: boolean;
+      trustRoot?: string | null;
+      allowedPaths?: string[];
+      loadOutsideResources?: boolean;
+    };
     expected: Record<string, unknown>;
   }[];
 }
@@ -32,8 +40,9 @@ for (const c of fixture.cases) {
       kind: (p) => (archives[p] ? 'archive' : files.includes(p) ? 'file' : directories.includes(p) ? 'directory' : null),
       findEntry: async (archive, entry) => archives[archive]?.entries.find((e) => samePath(e, entry)) ?? null,
       entryPoint: async (archive) => archives[archive]?.entryPoint ?? null,
+      trustRoot: fixture.host.trustRoot,
       ...c.context,
     };
-    assert.deepEqual(await resolveLink(c.from, c.link, host), c.expected);
+    assert.deepEqual(await resolveLink(c.from, c.link, host, c.use ?? 'navigate'), c.expected);
   });
 }

@@ -18,6 +18,9 @@ import { GraphIntegration } from './graph';
 import { MdzSearchView, VIEW_TYPE_MDZ_SEARCH } from './search-view';
 import { buildLinkIndex } from './link-index';
 import { MdzLinksView, VIEW_TYPE_MDZ_LINKS } from './links-view';
+import { MdzContentsView, VIEW_TYPE_MDZ_CONTENTS } from './contents-view';
+import { addSupportFile, type SupportFileKind } from './support-files';
+import { imageMarkup } from './image-insert-modal';
 import { ConvertNoteModal, convertNoteToMdz, InsertTarget, pasteIntoVault } from './convert';
 import { dropPosition, imageFiles } from './images';
 import { DEFAULT_SETTINGS, MdzSettings, MdzSettingTab } from './settings';
@@ -42,7 +45,7 @@ import { DEFAULT_SETTINGS, MdzSettings, MdzSettingTab } from './settings';
  *    searches inside every archive, since Obsidian's own index only covers
  *    .md files.
  *
- *  - An "MDZip links" panel listing incoming and outgoing links for archive
+ *  - An "Archive links" panel listing incoming and outgoing links for archive
  *    documents, and archive documents that link to a regular note.
  *
  *  - "Export note as .mdz" command – packages the active Markdown note into
@@ -61,7 +64,7 @@ export default class MdzPlugin extends Plugin {
     await this.loadSettings();
     this.addSettingTab(new MdzSettingTab(this.app, this));
 
-    // Link resolution between the vault and archives (spec Sections 9.3–9.5)
+    // Link resolution between the vault and archives (spec Sections 9.3–9.6)
     this.links = new VaultLinks(
       this.app,
       (path) => this.openArchiveIndex(path),
@@ -72,11 +75,12 @@ export default class MdzPlugin extends Plugin {
           .filter((e) => !e.isDirectory)
           .map((e) => e.path);
         return indexOf(entries, entryPointPath);
-      }
+      },
+      () => this.settings.outsideImages
     );
 
     // Register the custom view for .mdz files
-    this.registerView(VIEW_TYPE_MDZ, (leaf) => new MdzView(leaf, this.links));
+    this.registerView(VIEW_TYPE_MDZ, (leaf) => new MdzView(leaf, this.links, () => this.settings.archiveImages));
 
     // Archive documents in the graph, and search inside archives
     this.catalog = new ArchiveCatalog(this.app, this.links);
@@ -92,6 +96,55 @@ export default class MdzPlugin extends Plugin {
     this.registerView(VIEW_TYPE_MDZ_SEARCH, (leaf) => new MdzSearchView(leaf, this.catalog));
     this.addRibbonIcon('package-search', 'Search MDZip archives', () => void this.openSearch());
     this.registerView(VIEW_TYPE_MDZ_LINKS, (leaf) => new MdzLinksView(leaf, () => this.linkIndex()));
+    this.registerView(
+      VIEW_TYPE_MDZ_CONTENTS,
+      (leaf) => new MdzContentsView(leaf, (file, kind) => addSupportFile(this.app, file, kind))
+    );
+    for (const kind of ['README', 'AGENTS'] as SupportFileKind[]) {
+      this.addCommand({
+        id: `add-${kind.toLowerCase()}`,
+        name: `Add ${kind}.md to the archive`,
+        checkCallback: (checking: boolean) => {
+          const file = this.activeMdzView()?.file;
+          if (!file) return false;
+          if (!checking) void addSupportFile(this.app, file, kind);
+          return true;
+        },
+      });
+    }
+
+    // File menu (right-click in Files, and a tab's "More options"): archive
+    // actions for .mdz files, and Convert to MDZip for notes.
+    this.registerEvent(
+      this.app.workspace.on('file-menu', (menu, file) => {
+        if (!(file instanceof TFile)) return;
+        const ext = file.extension.toLowerCase();
+        if (ext === 'mdz') {
+          for (const kind of ['README', 'AGENTS'] as SupportFileKind[]) {
+            menu.addItem((item) =>
+              item
+                .setSection('action')
+                .setTitle(`Add ${kind}.md`)
+                .setIcon(kind === 'README' ? 'book-open' : 'bot')
+                .onClick(() => void addSupportFile(this.app, file, kind))
+            );
+          }
+        } else if (ext === 'md') {
+          menu.addItem((item) =>
+            item
+              .setSection('action')
+              .setTitle('Convert to MDZip')
+              .setIcon('package')
+              .onClick(() => void this.convertFile(file))
+          );
+        }
+      })
+    );
+    this.addCommand({
+      id: 'show-contents',
+      name: 'Show archive contents',
+      callback: () => void this.openContentsPanel(),
+    });
     this.addCommand({
       id: 'show-links',
       name: 'Show links for the current document',
@@ -235,7 +288,11 @@ export default class MdzPlugin extends Plugin {
     const file = view.file;
     if (!file) return;
     const act = async (convert: boolean) => {
-      if (convert) await convertNoteToMdz(this.app, view, files, source, target);
+      if (convert) {
+        await convertNoteToMdz(this.app, view, files, source, target, (path, image, alt) =>
+          imageMarkup(this.app, this.settings.archiveImages, path, image, alt)
+        );
+      }
       else await pasteIntoVault(this.app, file, editor, files, source, target);
     };
     if (this.settings.markdownPaste === 'convert') {
@@ -491,7 +548,39 @@ export default class MdzPlugin extends Plugin {
     }
   }
 
-  /** Show the MDZip links panel in the right sidebar. */
+  /** Show the Archive links panel in the right sidebar. */
+  /** Convert a note to .mdz, opening it first if it isn't open (Convert to MDZip in the file menu). */
+  private async convertFile(file: TFile): Promise<void> {
+    let view: MarkdownView | null = null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (!view && leaf.view instanceof MarkdownView && !(leaf.view instanceof MdzView) && leaf.view.file === file) {
+        view = leaf.view;
+      }
+    });
+    if (!view) {
+      const leaf = this.app.workspace.getLeaf(false);
+      await leaf.openFile(file);
+      view = leaf.view instanceof MarkdownView ? leaf.view : null;
+    }
+    if (view) await convertNoteToMdz(this.app, view);
+  }
+
+  /**
+   * Show the archive contents pane in the left sidebar, in its own section
+   * below the file explorer (not as another tab beside it, which would hide
+   * the file explorer). Once the user moves it, it stays where they put it.
+   */
+  async openContentsPanel(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(VIEW_TYPE_MDZ_CONTENTS)[0];
+    if (!leaf) {
+      leaf = workspace.getLeftLeaf(true) ?? workspace.getLeaf('split');
+      await leaf.setViewState({ type: VIEW_TYPE_MDZ_CONTENTS, active: false });
+    }
+    await workspace.revealLeaf(leaf);
+    await leaf.loadIfDeferred();
+  }
+
   async openLinksPanel(): Promise<void> {
     const { workspace } = this.app;
     let leaf = workspace.getLeavesOfType(VIEW_TYPE_MDZ_LINKS)[0];

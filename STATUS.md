@@ -1,5 +1,5 @@
 Status: awaiting-test
-Last:   Test vault (scripts/make-test-vault.py → ../TestVault) built + verified; plugin on local core-js 1.2.0 entry-point rules (revert file: dep before release) — please test
+Last:   Image paste options like Studio/VS Code (Markdown / HTML / ask: size + alignment); README/AGENTS; Convert to MDZip; contents pane; two-tab fix; 80/80 tests — please test
 
 Owner to-do (review/commit/release steps): ../planning/owner-todo.md
 

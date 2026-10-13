@@ -33,7 +33,10 @@ export async function convertNoteToMdz(
   view: MarkdownView,
   newImages: File[] = [],
   source: 'paste' | 'drop' = 'paste',
-  target?: InsertTarget
+  target?: InsertTarget,
+  /** Markup for each new image (the "Images pasted into archives" setting); null leaves it out. */
+  markup: (path: string, image: File, alt: string) => Promise<string | null> = async (path, _image, alt) =>
+    `![${alt}](${path})`
 ): Promise<void> {
   const file = view.file;
   if (!file || file.extension !== 'md') return;
@@ -58,8 +61,10 @@ export async function convertNoteToMdz(
         const stem =
           source === 'paste' ? `pasted-${Date.now()}` : safeFileStem(image.name) || `dropped-${Date.now()}`;
         const path = claim(stem, imageExtension(image));
+        const link = await markup(path, image, source === 'paste' ? 'Pasted image' : stem);
+        if (link === null) continue;
         images.push({ path, data: new Uint8Array(await image.arrayBuffer()) });
-        links.push(`![${source === 'paste' ? 'Pasted image' : stem}](${path})`);
+        links.push(link);
       }
       const { before, after } = blockPadding(editor, target.from, target.to);
       const inserted = before + links.join(before || after ? '\n\n' : '\n') + after;
