@@ -282,3 +282,19 @@
 .mdz-image-insert .mdz-field-disabled {
   opacity: 0.5;
 }
+
+/* Path dialogs (new document, new folder, rename) */
+.mdz-path-prompt-input {
+  width: 100%;
+  min-width: 16em;
+}
+
+.mdz-path-prompt-error {
+  color: var(--text-error);
+}
+
+/* Drop target while dragging an entry in the Archive contents pane */
+.mdz-contents .mdz-drop-target {
+  background-color: var(--background-modifier-hover);
+  border-radius: var(--radius-s);
+}

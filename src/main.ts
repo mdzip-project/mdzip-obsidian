@@ -20,6 +20,7 @@ import { buildLinkIndex } from './link-index';
 import { MdzLinksView, VIEW_TYPE_MDZ_LINKS } from './links-view';
 import { MdzContentsView, VIEW_TYPE_MDZ_CONTENTS } from './contents-view';
 import { addSupportFile, type SupportFileKind } from './support-files';
+import { archiveActions, type ArchiveActions } from './archive-actions';
 import { imageMarkup } from './image-insert-modal';
 import { ConvertNoteModal, convertNoteToMdz, InsertTarget, pasteIntoVault } from './convert';
 import { dropPosition, imageFiles } from './images';
@@ -59,6 +60,7 @@ export default class MdzPlugin extends Plugin {
   links!: VaultLinks;
   catalog!: ArchiveCatalog;
   graph!: GraphIntegration;
+  actions!: ArchiveActions;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -96,10 +98,9 @@ export default class MdzPlugin extends Plugin {
     this.registerView(VIEW_TYPE_MDZ_SEARCH, (leaf) => new MdzSearchView(leaf, this.catalog));
     this.addRibbonIcon('package-search', 'Search MDZip archives', () => void this.openSearch());
     this.registerView(VIEW_TYPE_MDZ_LINKS, (leaf) => new MdzLinksView(leaf, () => this.linkIndex()));
-    this.registerView(
-      VIEW_TYPE_MDZ_CONTENTS,
-      (leaf) => new MdzContentsView(leaf, (file, kind) => addSupportFile(this.app, file, kind))
-    );
+    this.actions = archiveActions(this.app, (file, kind) => addSupportFile(this.app, file, kind));
+    this.registerView(VIEW_TYPE_MDZ_CONTENTS, (leaf) => new MdzContentsView(leaf, this.actions));
+    this.registerArchiveCommands();
     for (const kind of ['README', 'AGENTS'] as SupportFileKind[]) {
       this.addCommand({
         id: `add-${kind.toLowerCase()}`,
@@ -120,6 +121,13 @@ export default class MdzPlugin extends Plugin {
         if (!(file instanceof TFile)) return;
         const ext = file.extension.toLowerCase();
         if (ext === 'mdz') {
+          menu.addItem((item) =>
+            item
+              .setSection('action')
+              .setTitle('New document in archive')
+              .setIcon('file-plus')
+              .onClick(() => void this.actions.newDocument(file))
+          );
           for (const kind of ['README', 'AGENTS'] as SupportFileKind[]) {
             menu.addItem((item) =>
               item
@@ -257,6 +265,29 @@ export default class MdzPlugin extends Plugin {
   }
 
   onunload(): void {}
+
+  /** Commands that change the active archive, or the document open in it. */
+  private registerArchiveCommands(): void {
+    const onArchive = (id: string, name: string, run: (file: TFile, doc: string) => void) =>
+      this.addCommand({
+        id,
+        name,
+        checkCallback: (checking: boolean) => {
+          const view = this.activeMdzView();
+          if (!view?.file) return false;
+          if (!checking) run(view.file, view.getCurrentDocument());
+          return true;
+        },
+      });
+    onArchive('new-document', 'New document in archive', (file) => void this.actions.newDocument(file));
+    onArchive('new-folder', 'New folder in archive', (file) => void this.actions.newFolder(file));
+    onArchive('rename-document', 'Rename current document in archive', (file, doc) => void this.actions.rename(file, doc, false));
+    onArchive('move-document', 'Move current document to another folder in archive', (file, doc) =>
+      void this.actions.moveTo(file, doc, false)
+    );
+    onArchive('make-entry-point', 'Make current document the entry point', (file, doc) => void this.actions.setEntryPoint(file, doc));
+    onArchive('delete-document', 'Delete current document from archive', (file, doc) => void this.actions.remove(file, doc, false));
+  }
 
   async loadSettings(): Promise<void> {
     this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) ?? {}) };

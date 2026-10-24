@@ -88,6 +88,8 @@ export class MdzView extends MarkdownView {
   /** Entry index for link resolution, rebuilt when the archive changes. */
   private entryIndex: { generation: number; index: ArchiveIndex } | null = null;
   private links: VaultLinks;
+  /** Entry moves another tab is about to write (old path → new); the reload that follows uses them. */
+  private expectedMoves: ReadonlyMap<string, string> | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -277,12 +279,20 @@ export class MdzView extends MarkdownView {
     let bytes: ArrayBuffer;
     let opened: OpenedArchive;
     let markdown: string | null;
+    let moved: string | null = null;
     try {
       bytes = await this.app.vault.readBinary(file);
       // The modify event from our own write.
       if (sameBytes(bytes, this.archiveBytes)) return;
       opened = await openArchive(bytes);
-      markdown = await readDocument(opened.archive, this.currentDoc);
+      // This document moved in another tab's change: follow it, once these bytes show the move
+      // (an earlier reload, from another tab saving first, may come before it).
+      const to = this.expectedMoves?.get(this.currentDoc);
+      if (to && opened.archive.findEntry(to) && !opened.archive.findEntry(this.currentDoc)) {
+        moved = to;
+        this.expectedMoves = null;
+      }
+      markdown = await readDocument(opened.archive, moved ?? this.currentDoc);
     } catch {
       return; // Keep the current state; the next successful change will reload.
     }
@@ -291,6 +301,11 @@ export class MdzView extends MarkdownView {
     this.isProject = opened.mode === 'project';
     this.entryPointPath = opened.entryPointPath;
     this.setArchive(bytes, opened.archive);
+
+    if (moved && markdown !== null) {
+      this.showLoaded(moved, markdown);
+      return;
+    }
 
     if (markdown === null) {
       // The document was removed externally; fall back to the entry point.
@@ -618,9 +633,29 @@ export class MdzView extends MarkdownView {
     return this.archiveGeneration;
   }
 
-  /** Every entry of the archive, for the contents pane. */
+  /** Every entry of the archive, including directory entries, for the contents pane. */
   listArchiveEntries(): { path: string; isMarkdown: boolean; isImage: boolean; isDirectory: boolean; size?: number }[] {
-    return this.archive ? this.archive.listEntries() : [];
+    return this.archive ? this.archive.listEntries({ includeDirectories: true }) : [];
+  }
+
+  /**
+   * Another tab is about to write a change that moves entries (old path →
+   * new; the map may be filled in until the write). When the reload it
+   * causes comes, this tab follows its document to its new path.
+   */
+  expectMoves(moves: ReadonlyMap<string, string>): void {
+    this.expectedMoves = moves;
+  }
+
+  /** Show `doc`, just read from the archive, if it isn't what's shown already. */
+  private showLoaded(doc: string, markdown: string): void {
+    const switched = doc !== this.currentDoc;
+    this.currentDoc = doc;
+    this.lastSavedMarkdown = markdown;
+    this.data = markdown;
+    if (markdown !== this.getViewData()) this.setViewData(markdown, switched);
+    this.updateDocumentUi();
+    if (switched) this.app.workspace.trigger('mdzip:document-open', this);
   }
 
   /** Text of an archive entry (including unsaved edits to documents), or null. */
@@ -632,9 +667,14 @@ export class MdzView extends MarkdownView {
    * Change the archive through this view's write queue, so it can't race the
    * view's own saves: the current document's edits are saved first, then
    * `change` gets the archive bytes and returns the new bytes, which are
-   * written to the file and reloaded here.
+   * written to the file and reloaded here. If the change moves entries,
+   * `moves` (old path → new, read after `change` runs) lets this tab follow
+   * its document; if it removes the document, the tab shows the entry point.
    */
-  async modifyArchive(change: (bytes: ArrayBuffer) => Promise<ArrayBuffer>): Promise<void> {
+  async modifyArchive(
+    change: (bytes: ArrayBuffer) => Promise<ArrayBuffer>,
+    moves?: ReadonlyMap<string, string>
+  ): Promise<void> {
     const file = this.file;
     if (!file) throw new Error('No archive is open.');
     let failure: unknown = null;
@@ -652,7 +692,11 @@ export class MdzView extends MarkdownView {
         this.isProject = opened.mode === 'project';
         this.entryPointPath = opened.entryPointPath;
         this.setArchive(bytes, opened.archive);
-        this.updateDocumentUi();
+        // The change may have moved, removed or rewritten (links) the document shown here.
+        const doc = moves?.get(this.currentDoc) ?? this.currentDoc;
+        const markdown = await readDocument(opened.archive, doc);
+        if (markdown !== null) this.showLoaded(doc, markdown);
+        else this.showLoaded(opened.entryPointPath, (await readDocument(opened.archive, opened.entryPointPath)) ?? '');
       } catch (err) {
         failure = err;
       }

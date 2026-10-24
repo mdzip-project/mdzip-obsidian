@@ -83,12 +83,17 @@ Markdown files reference images and other assets with relative paths. Resolve th
 `;
 }
 
+/** The open tabs showing `file`. */
+export function viewsOf(app: App, file: TFile): MdzView[] {
+  return app.workspace
+    .getLeavesOfType(VIEW_TYPE_MDZ)
+    .map((leaf) => leaf.view)
+    .filter((view): view is MdzView => view instanceof MdzView && view.file === file);
+}
+
 /** The open tab showing `file`, if any. */
 export function viewOf(app: App, file: TFile): MdzView | null {
-  for (const leaf of app.workspace.getLeavesOfType(VIEW_TYPE_MDZ)) {
-    if (leaf.view instanceof MdzView && leaf.view.file === file) return leaf.view;
-  }
-  return null;
+  return viewsOf(app, file)[0] ?? null;
 }
 
 /** The stored path of a root-level support file of this kind (any ASCII case), or null. */
@@ -98,29 +103,65 @@ function existingPath(archive: MdzArchiveCore, kind: SupportFileKind): string | 
   return found?.path ?? null;
 }
 
-/** Add the file, keeping the entry point where it is (spec Section 14.1). */
+/**
+ * Add a file at `path`, keeping the entry point where it is (spec Section
+ * 14.1). An archive without a manifest gets one, so that the new file can't
+ * make its entry point ambiguous (for example README.md + AGENTS.md alone, or
+ * a second root-level document).
+ */
+export async function withEntry(bytes: ArrayBuffer, path: string, text: string): Promise<ArrayBuffer> {
+  const opened = await openArchive(bytes);
+  const manifest = await opened.archive.readManifest();
+  const options = manifest
+    ? undefined
+    : { manifest: MdzPackagerCore.createManifest({ entryPoint: opened.entryPointPath, mode: opened.mode }) };
+  const result = await MdzArchiveCore.updateFiles(new Uint8Array(bytes), [{ path, content: text }], [], options);
+  const next = await result.blob.arrayBuffer();
+  const reopened = await openArchive(next);
+  if (reopened.entryPointPath !== opened.entryPointPath) {
+    throw new Error(`adding ${path} would change the entry point; nothing was changed`);
+  }
+  return next;
+}
+
+/**
+ * Change an archive through its open tab when there is one (so the change
+ * can't race the tab's own saves), else directly in the vault. Other tabs on
+ * the archive save first, so their edits are in the bytes being changed. When
+ * the change moves entries, `moves` (old path → new, filled in by `change`)
+ * lets every tab follow its document.
+ */
+export async function changeArchive(
+  app: App,
+  file: TFile,
+  change: (bytes: ArrayBuffer) => Promise<ArrayBuffer>,
+  moves?: ReadonlyMap<string, string>
+): Promise<void> {
+  const [view, ...others] = viewsOf(app, file);
+  for (const other of others) {
+    await other.save();
+    if (moves) other.expectMoves(moves);
+  }
+  if (view) await view.modifyArchive(change, moves);
+  else await app.vault.modifyBinary(file, await change(await app.vault.readBinary(file)));
+}
+
+/** Show a document of the archive, opening the archive in a tab first if it isn't open. */
+export async function showInArchive(app: App, file: TFile, path: string): Promise<void> {
+  let view = viewOf(app, file);
+  if (!view) {
+    await app.workspace.getLeaf(false).openFile(file);
+    view = viewOf(app, file);
+  }
+  await view?.openDocument(path);
+}
+
 async function withSupportFile(bytes: ArrayBuffer, kind: SupportFileKind, fileName: string): Promise<ArrayBuffer> {
   const opened = await openArchive(bytes);
   const manifest = await opened.archive.readManifest();
   const title = manifest?.title || fileName.replace(/\.mdz$/i, '');
   const text = supportFileText(kind, { title, entryPoint: opened.entryPointPath, mode: opened.mode });
-  // An archive without a manifest gets one, so that a new support file can't
-  // make its entry point ambiguous (for example README.md + AGENTS.md alone).
-  const options = manifest
-    ? undefined
-    : { manifest: MdzPackagerCore.createManifest({ entryPoint: opened.entryPointPath, mode: opened.mode }) };
-  const result = await MdzArchiveCore.updateFiles(
-    new Uint8Array(bytes),
-    [{ path: SUPPORT_FILE_PATHS[kind], content: text }],
-    [],
-    options
-  );
-  const next = await result.blob.arrayBuffer();
-  const reopened = await openArchive(next);
-  if (reopened.entryPointPath !== opened.entryPointPath) {
-    throw new Error(`adding ${SUPPORT_FILE_PATHS[kind]} would change the entry point; nothing was changed`);
-  }
-  return next;
+  return withEntry(bytes, SUPPORT_FILE_PATHS[kind], text);
 }
 
 /**
@@ -131,23 +172,12 @@ async function withSupportFile(bytes: ArrayBuffer, kind: SupportFileKind, fileNa
 export async function addSupportFile(app: App, file: TFile, kind: SupportFileKind): Promise<void> {
   const name = SUPPORT_FILE_PATHS[kind];
   try {
-    let view = viewOf(app, file);
     const existing = existingPath((await openArchive(await app.vault.readBinary(file))).archive, kind);
-
     if (!existing) {
-      if (view) {
-        await view.modifyArchive((bytes) => withSupportFile(bytes, kind, file.name));
-      } else {
-        await app.vault.modifyBinary(file, await withSupportFile(await app.vault.readBinary(file), kind, file.name));
-      }
+      await changeArchive(app, file, (bytes) => withSupportFile(bytes, kind, file.name));
       new Notice(`Added ${name} to ${file.name}.`);
     }
-
-    if (!view) {
-      await app.workspace.getLeaf(false).openFile(file);
-      view = viewOf(app, file);
-    }
-    await view?.openDocument(existing ?? name);
+    await showInArchive(app, file, existing ?? name);
   } catch (err) {
     new Notice(`Couldn't add ${name} to ${file.name}: ${err instanceof Error ? err.message : String(err)}`);
   }
