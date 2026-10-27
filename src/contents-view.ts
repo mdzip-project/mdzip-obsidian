@@ -283,7 +283,7 @@ export class MdzContentsView extends ItemView {
     }
     section.createDiv({ cls: 'mdz-contents-text-heading', text: 'In documents' });
     const status = section.createDiv({ cls: 'mdz-contents-note', text: 'Searching…' });
-    window.setTimeout(async () => {
+    window.setTimeout(() => void (async () => {
       if (renderId !== this.renderId) return;
       const docs: [string, LineMatch[]][] = [];
       let count = 0;
@@ -310,7 +310,7 @@ export class MdzContentsView extends ItemView {
       status.remove();
       section.empty();
       this.renderTextMatches(section, view, this.textMatches);
-    }, TEXT_SEARCH_DELAY);
+    })(), TEXT_SEARCH_DELAY);
   }
 
   private renderTextMatches(section: HTMLElement, view: MdzView, result: { docs: [string, LineMatch[]][]; count: number }): void {
@@ -529,8 +529,9 @@ export class MdzContentsView extends ItemView {
       const entries = view.listArchiveEntries();
       let cover: string | undefined;
       try {
-        const manifest = JSON.parse((await view.readArchiveText('manifest.json')) ?? 'null');
-        if (manifest && typeof manifest.cover === 'string') cover = manifest.cover;
+        const manifest: unknown = JSON.parse((await view.readArchiveText('manifest.json')) ?? 'null');
+        const value = manifest && typeof manifest === 'object' ? (manifest as { cover?: unknown }).cover : undefined;
+        if (typeof value === 'string') cover = value;
       } catch {
         // No readable manifest: nothing is referenced through it.
       }

@@ -58,7 +58,14 @@ function permitted(host: LinkHost, path: string): boolean {
 }
 
 const SCHEME = /^[a-z][a-z0-9+.-]*:/i;
-const BAD_SEGMENT = /[/\\\u0000-\u001f\u007f]/;
+/** True for a slash, backslash or control character, none of which can appear in a decoded segment. */
+function hasBadChar(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f || c === 0x2f || c === 0x5c) return true;
+  }
+  return false;
+}
 
 /** True for a name with an `.mdz` extension, compared ASCII case-insensitively. */
 export function isMdzName(name: string): boolean {
@@ -87,7 +94,7 @@ function segmentsOf(dest: string): string[] | null {
     } catch {
       return null;
     }
-    if (BAD_SEGMENT.test(s)) return null;
+    if (hasBadChar(s)) return null;
     segs.push(s);
   }
   return segs;

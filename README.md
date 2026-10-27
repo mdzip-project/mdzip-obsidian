@@ -30,7 +30,19 @@ MDZip plugin for Obsidian. Read and write `.mdz` archives — single documents a
 >
 > **Obsidian's link autocomplete doesn't know about archives.** Inside a `.mdz`, Obsidian treats the archive as a single file, so with the _Relative path to file_ link format it writes links to neighbouring vault files one `../` short. Shortest-path and wikilink formats are unaffected.
 
+## Privacy
+
+MDZip works only on your vault, on your device. It makes no network requests and collects nothing.
+
+- **Lists the files in your vault** to find `.mdz` archives, for MDZip search, the graph and the links panel, and to find notes that link into an archive so those links can follow it when it's renamed.
+- **Reads and writes vault files** through Obsidian: the `.mdz` archives you open or change, and notes whose links it updates.
+- **Uses the clipboard** only when you ask: _Copy path_ and _Copy link_ in the _Archive contents_ pane write to it, and pasting an image reads just that paste. It never reads the clipboard on its own.
+
 ## Installation
+
+### From a release
+
+Download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/mdzip-project/mdzip-obsidian/releases/latest) into your vault's `.obsidian/plugins/mdzip/` folder, reload Obsidian and turn on MDZip under Settings → Community plugins. The release files are built on GitHub from this repository and carry an [artifact attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds); `gh attestation verify main.js --repo mdzip-project/mdzip-obsidian` checks one.
 
 ### Manual (development)
 

@@ -289,7 +289,8 @@ class ConfirmModal extends Modal {
       .addButton((btn) =>
         btn
           .setButtonText('Delete')
-          .setWarning()
+          .setDestructive()
+          .setCta()
           .onClick(() => {
             this.close();
             this.onConfirm();

@@ -1,7 +1,7 @@
 {
   "id": "mdzip",
   "name": "MDZip",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.14.5",
   "description": "Open and edit .mdz (MDZip) archives: Markdown documents and their images in one file, with folders, links and search.",
   "author": "mdzip-project",

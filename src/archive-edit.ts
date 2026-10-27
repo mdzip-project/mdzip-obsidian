@@ -117,8 +117,8 @@ export function planRemove(listing: Listing, source: string, isFolder: boolean):
 async function rawManifest(archive: MdzArchiveCore): Promise<Record<string, unknown> | null> {
   const entry = archive.findEntry('manifest.json') as { async(kind: 'text'): Promise<string> } | null;
   if (!entry) return null;
-  const parsed = JSON.parse(await entry.async('text'));
-  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  const parsed: unknown = JSON.parse(await entry.async('text'));
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
 }
 
 /**

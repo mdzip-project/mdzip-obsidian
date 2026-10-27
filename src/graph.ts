@@ -1,4 +1,5 @@
 import type { App, View, WorkspaceLeaf } from 'obsidian';
+import { around } from 'monkey-around';
 import type { ArchiveCatalog, ArchiveSummary, NoteToArchiveLink } from './archive-catalog';
 
 /** The data Obsidian's graph view hands to its renderer. */
@@ -225,8 +226,8 @@ export class GraphIntegration {
     summaries: [],
     noteLinks: new Map(),
   };
-  /** Wrapped renderers and their original setData, to restore on unload. */
-  private wrapped = new Map<{ setData(data: GraphData): void }, { original: (data: GraphData) => void; engine: GraphEngine }>();
+  /** Wrapped renderers, with the function that unwraps each and its engine, to restore on unload. */
+  private wrapped = new Map<{ setData(data: GraphData): void }, { unwrap: () => void; engine: GraphEngine }>();
 
   private app: App;
   private catalog: ArchiveCatalog;
@@ -257,23 +258,24 @@ export class GraphIntegration {
     const engine = view.dataEngine ?? view.engine;
     if (!renderer || !engine || typeof renderer.setData !== 'function') return;
     if (!this.wrapped.has(renderer)) {
-      const original = renderer.setData;
-      const bound = original.bind(renderer);
-      this.wrapped.set(renderer, { original, engine });
-      renderer.setData = (data: GraphData) => {
-        try {
-          const options = engine.options;
-          data = addArchivesToGraph(data, options, {
-            ...this.input,
-            resolvedLinks: this.app.metadataCache.resolvedLinks,
-            focus: this.focusFor(options.localFile),
-            match: engineMatch(engine),
-          });
-        } catch (err) {
-          console.error('MDZip: could not add archives to the graph', err);
-        }
-        bound(data);
-      };
+      const unwrap = around(renderer, {
+        setData: (next) =>
+          (data: GraphData) => {
+            try {
+              const options = engine.options;
+              data = addArchivesToGraph(data, options, {
+                ...this.input,
+                resolvedLinks: this.app.metadataCache.resolvedLinks,
+                focus: this.focusFor(options.localFile),
+                match: engineMatch(engine),
+              });
+            } catch (err) {
+              console.error('MDZip: could not add archives to the graph', err);
+            }
+            next.call(renderer, data);
+          },
+      });
+      this.wrapped.set(renderer, { unwrap, engine });
       redraw = true;
     }
     if (redraw) engine.render();
@@ -281,8 +283,8 @@ export class GraphIntegration {
 
   /** Restore every wrapped graph view and redraw it without archive nodes. */
   unhookAll(): void {
-    for (const [renderer, { original, engine }] of this.wrapped) {
-      renderer.setData = original;
+    for (const { unwrap, engine } of this.wrapped.values()) {
+      unwrap();
       try {
         engine.render();
       } catch {

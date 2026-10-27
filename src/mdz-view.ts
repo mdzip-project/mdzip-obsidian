@@ -690,12 +690,12 @@ export class MdzView extends MarkdownView {
   ): Promise<void> {
     const file = this.file;
     if (!file) throw new Error('No archive is open.');
-    let failure: unknown = null;
+    const result: { failure?: Error } = {};
     await this.enqueue(async () => {
       if (this.file !== file) return;
       await this.writeArchive(file, []);
       if (!this.archiveBytes) {
-        failure = new Error(`${file.name} couldn't be read.`);
+        result.failure = new Error(`${file.name} couldn't be read.`);
         return;
       }
       try {
@@ -711,10 +711,10 @@ export class MdzView extends MarkdownView {
         if (markdown !== null) this.showLoaded(doc, markdown);
         else this.showLoaded(opened.entryPointPath, (await readDocument(opened.archive, opened.entryPointPath)) ?? '');
       } catch (err) {
-        failure = err;
+        result.failure = err instanceof Error ? err : new Error(String(err));
       }
     });
-    if (failure) throw failure;
+    if (result.failure) throw result.failure;
   }
 
   /** Blob URL for an image entry, or null. The caller revokes it when done. */
@@ -797,7 +797,7 @@ export class MdzView extends MarkdownView {
       if (archive !== this.archive) return;
       el.setAttribute('data-mdz-gen', generation);
       if (!url) continue;
-      if (el instanceof HTMLImageElement) {
+      if (el.instanceOf(HTMLImageElement)) {
         el.setAttribute('src', url);
         continue;
       }

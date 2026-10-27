@@ -32,7 +32,7 @@ export function findLinkSpans(markdown: string): LinkSpan[] {
   const text = maskCode(markdown);
   const spans: LinkSpan[] = [];
   for (const m of text.matchAll(/(!?\[\[)([^\]|]+?)(?:\|[^\]]*)?\]\]/g)) {
-    const start = m.index! + m[1].length;
+    const start = m.index + m[1].length;
     spans.push({ start, end: start + m[2].length, syntax: 'wiki', angled: false });
   }
   const markdownDest = (m: RegExpMatchArray, prefix: string, dest: string) => {
@@ -48,7 +48,7 @@ export function findLinkSpans(markdown: string): LinkSpan[] {
   for (const m of text.matchAll(/^([ ]{0,3}\[[^\]\n]+\]:[ \t]*)(<[^>\n]*>|\S+)/gm)) markdownDest(m, m[1], m[2]);
   for (const m of text.matchAll(/(<(?:a|img)\b[^>]*?\s(?:href|src)\s*=\s*)(?:"([^"]*)"|'([^']*)')/gi)) {
     const value = m[2] ?? m[3] ?? '';
-    const start = m.index! + m[1].length + 1;
+    const start = m.index + m[1].length + 1;
     spans.push({ start, end: start + value.length, syntax: 'html', angled: false });
   }
   return spans.sort((a, b) => a.start - b.start);

@@ -6,10 +6,12 @@ import {
   parseLinktext,
   Plugin,
   TFile,
+  Vault,
   ViewState,
   WorkspaceLeaf,
 } from 'obsidian';
 import { MdzPackagerCore } from '@mdzip/core-js';
+import { around } from 'monkey-around';
 import { MdzView, VIEW_TYPE_MDZ, openArchive, readEntryMarkdown } from './mdz-view';
 import { isBareName, LinkTarget, mentionsArchive } from './links';
 import { ArchiveIndex, indexOf, VaultLinks } from './vault-links';
@@ -244,7 +246,7 @@ export default class MdzPlugin extends Plugin {
         const activeFile = this.app.workspace.getActiveFile();
         if (activeFile && activeFile.extension === 'md') {
           if (!checking) {
-            this.exportNoteAsMdz(activeFile);
+            void this.exportNoteAsMdz(activeFile);
           }
           return true;
         }
@@ -260,7 +262,7 @@ export default class MdzPlugin extends Plugin {
         const view = this.activeMdzView();
         if (view) {
           if (!checking) {
-            this.extractMarkdownFromView(view);
+            void this.extractMarkdownFromView(view);
           }
           return true;
         }
@@ -295,7 +297,8 @@ export default class MdzPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = { ...DEFAULT_SETTINGS, ...((await this.loadData()) ?? {}) };
+    const saved = (await this.loadData()) as Partial<MdzSettings> | null;
+    this.settings = { ...DEFAULT_SETTINGS, ...(saved ?? {}) };
   }
 
   async saveSettings(): Promise<void> {
@@ -363,37 +366,38 @@ export default class MdzPlugin extends Plugin {
       console.warn(`MDZip: blocked a text write to ${file.path} (.mdz files are binary archives).`);
     const readMarkdown = async (file: TFile) => readEntryMarkdown(await vault.readBinary(file));
 
-    const { read, cachedRead, modify, append, process } = vault;
-    vault.read = function (file) {
-      if (isMdz(file)) return readMarkdown(file).catch(() => '');
-      return read.call(this, file);
-    };
-    vault.cachedRead = function (file) {
-      if (isMdz(file)) return readMarkdown(file).catch(() => '');
-      return cachedRead.call(this, file);
-    };
-    vault.modify = function (file, data, options) {
-      if (isMdz(file)) return Promise.resolve(refuse(file));
-      return modify.call(this, file, data, options);
-    };
-    vault.append = function (file, data, options) {
-      if (isMdz(file)) return Promise.resolve(refuse(file));
-      return append.call(this, file, data, options);
-    };
-    vault.process = function (file, fn, options) {
-      if (isMdz(file)) {
-        refuse(file);
-        return Promise.reject(new Error(`${file.path} is a binary .mdz archive`));
-      }
-      return process.call(this, file, fn, options);
-    };
-    this.register(() => {
-      vault.read = read;
-      vault.cachedRead = cachedRead;
-      vault.modify = modify;
-      vault.append = append;
-      vault.process = process;
-    });
+    this.register(
+      around(vault, {
+        read: (next) =>
+          function (this: Vault, file) {
+            if (isMdz(file)) return readMarkdown(file).catch(() => '');
+            return next.call(this, file);
+          },
+        cachedRead: (next) =>
+          function (this: Vault, file) {
+            if (isMdz(file)) return readMarkdown(file).catch(() => '');
+            return next.call(this, file);
+          },
+        modify: (next) =>
+          function (this: Vault, file, data, options) {
+            if (isMdz(file)) return Promise.resolve(refuse(file));
+            return next.call(this, file, data, options);
+          },
+        append: (next) =>
+          function (this: Vault, file, data, options) {
+            if (isMdz(file)) return Promise.resolve(refuse(file));
+            return next.call(this, file, data, options);
+          },
+        process: (next) =>
+          function (this: Vault, file, fn, options) {
+            if (isMdz(file)) {
+              refuse(file);
+              return Promise.reject(new Error(`${file.path} is a binary .mdz archive`));
+            }
+            return next.call(this, file, fn, options);
+          },
+      })
+    );
   }
 
   /**
@@ -406,15 +410,14 @@ export default class MdzPlugin extends Plugin {
    * .mdz tab already saved in the workspace as a plain Markdown view.
    */
   private redirectMarkdownViewState(): void {
-    const proto = WorkspaceLeaf.prototype;
-    const original = proto.setViewState;
-    const patched = function (this: WorkspaceLeaf, viewState: ViewState, eState?: unknown) {
-      return original.call(this, toMdzViewState(viewState), eState);
-    };
-    proto.setViewState = patched;
-    this.register(() => {
-      if (proto.setViewState === patched) proto.setViewState = original;
-    });
+    this.register(
+      around(WorkspaceLeaf.prototype, {
+        setViewState: (next) =>
+          function (this: WorkspaceLeaf, viewState: ViewState, eState?: unknown) {
+            return next.call(this, toMdzViewState(viewState), eState);
+          },
+      })
+    );
 
     this.app.workspace.onLayoutReady(() => {
       this.app.workspace.iterateAllLeaves((leaf) => {
@@ -447,22 +450,21 @@ export default class MdzPlugin extends Plugin {
    * note.
    */
   private followArchiveLinks(): void {
-    const proto = WorkspaceLeaf.prototype;
-    const original = proto.openLinkText;
-    const plugin = this;
-    const patched = async function (
-      this: WorkspaceLeaf,
-      linktext: string,
-      sourcePath: string,
-      openViewState?: OpenViewState
-    ): Promise<void> {
-      if (await plugin.openArchiveLink(this, linktext, sourcePath, openViewState)) return;
-      return original.call(this, linktext, sourcePath, openViewState);
-    };
-    proto.openLinkText = patched;
-    this.register(() => {
-      if (proto.openLinkText === patched) proto.openLinkText = original;
-    });
+    const openArchiveLink = this.openArchiveLink.bind(this);
+    this.register(
+      around(WorkspaceLeaf.prototype, {
+        openLinkText: (next) =>
+          async function (
+            this: WorkspaceLeaf,
+            linktext: string,
+            sourcePath: string,
+            openViewState?: OpenViewState
+          ): Promise<void> {
+            if (await openArchiveLink(this, linktext, sourcePath, openViewState)) return;
+            return next.call(this, linktext, sourcePath, openViewState);
+          },
+      })
+    );
   }
 
   /** Open `linktext` in `leaf` if it's an archive link; false to let Obsidian handle it. */
@@ -742,11 +744,7 @@ export default class MdzPlugin extends Plugin {
 
   /** Returns the {@link MdzView} in the currently active leaf, or null. */
   private activeMdzView(): MdzView | null {
-    const activeLeaf = this.app.workspace.activeLeaf;
-    if (activeLeaf && activeLeaf.view instanceof MdzView) {
-      return activeLeaf.view;
-    }
-    return null;
+    return this.app.workspace.getActiveViewOfType(MdzView);
   }
 }
 

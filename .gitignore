@@ -3,3 +3,5 @@ main.js
 *.js.map
 .DS_Store
 private/
+# Plugin settings written by Obsidian when the repo is used as a plugin folder
+data.json
