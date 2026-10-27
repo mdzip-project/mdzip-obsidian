@@ -100,6 +100,23 @@ export function buildContentsTree(entries: ContentsEntry[], entryPoint: string):
   return root.children;
 }
 
+/**
+ * The tree cut down to entries whose path contains `query`
+ * (case-insensitive), with the folders that lead to them. A folder whose own
+ * path matches keeps all of its contents. Order is kept. Pure.
+ */
+export function filterContentsTree(nodes: ContentsNode[], query: string): ContentsNode[] {
+  const needle = query.trim().toLocaleLowerCase();
+  if (!needle) return nodes;
+  const keep = (node: ContentsNode): ContentsNode | null => {
+    if (node.path.toLocaleLowerCase().includes(needle)) return node;
+    if (node.kind !== 'folder') return null;
+    const children = node.children.map(keep).filter((n): n is ContentsNode => n !== null);
+    return children.length ? { ...node, children } : null;
+  };
+  return nodes.map(keep).filter((n): n is ContentsNode => n !== null);
+}
+
 /** Every node in the tree, depth first. */
 export function walk(nodes: ContentsNode[]): ContentsNode[] {
   return nodes.flatMap((n) => [n, ...walk(n.children)]);

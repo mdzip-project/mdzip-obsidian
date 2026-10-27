@@ -236,6 +236,41 @@
   padding: 0 var(--size-4-2) var(--size-4-3);
 }
 
+/* Search box under the header buttons; text matches below the tree. */
+.mdz-contents .mdz-contents-search {
+  margin: 0 var(--size-4-3) var(--size-4-2);
+}
+
+.mdz-contents-note {
+  padding: var(--size-4-1) var(--size-4-3);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.mdz-contents-text {
+  padding: 0 var(--size-4-2) var(--size-4-3);
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.mdz-contents-text-heading {
+  padding: var(--size-4-2) var(--size-4-1) var(--size-4-1);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+}
+
+.mdz-contents-text .mdz-search-doc {
+  margin: var(--size-4-1) 0 0;
+}
+
+.mdz-contents-text-doc {
+  cursor: pointer;
+}
+
+.mdz-contents-text-doc:hover {
+  color: var(--text-normal);
+}
+
 .mdz-contents-flag {
   display: inline-flex;
   align-items: center;

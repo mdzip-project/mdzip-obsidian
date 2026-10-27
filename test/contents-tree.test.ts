@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildContentsTree, findUnreferencedImages, isSupportFile, walk, type ContentsEntry } from '../src/contents-tree.ts';
+import { buildContentsTree, filterContentsTree, findUnreferencedImages, isSupportFile, walk, type ContentsEntry } from '../src/contents-tree.ts';
 
 const entry = (path: string, extra: Partial<ContentsEntry> = {}): ContentsEntry => ({
   path,
@@ -65,4 +65,21 @@ test('images referenced by links, wikilink embeds, HTML or the cover are not rep
   ].map((p) => entry(p));
   const unreferenced = await findUnreferencedImages(entries, async (p) => docs[p] ?? null, './images/cover.png');
   assert.deepEqual([...unreferenced].sort(), ['images/code.png', 'images/unused.png']);
+});
+
+test('filtering keeps matching entries and the folders leading to them', () => {
+  const entries: ContentsEntry[] = [
+    { path: 'index.md', isMarkdown: true, isImage: false, isDirectory: false },
+    { path: 'beds/tomatoes.md', isMarkdown: true, isImage: false, isDirectory: false },
+    { path: 'beds/beans.md', isMarkdown: true, isImage: false, isDirectory: false },
+    { path: 'images/Tomato-plot.webp', isMarkdown: false, isImage: true, isDirectory: false },
+    { path: 'plans/watering.md', isMarkdown: true, isImage: false, isDirectory: false },
+  ];
+  const tree = buildContentsTree(entries, 'index.md');
+  const paths = (q: string) => walk(filterContentsTree(tree, q)).map((n) => n.path);
+  assert.deepEqual(paths('TOMATO'), ['beds', 'beds/tomatoes.md', 'images', 'images/Tomato-plot.webp']);
+  // A matching folder keeps everything in it.
+  assert.deepEqual(paths('plans'), ['plans', 'plans/watering.md']);
+  assert.deepEqual(paths('cucumber'), []);
+  assert.equal(filterContentsTree(tree, '  '), tree);
 });

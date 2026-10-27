@@ -3,6 +3,7 @@ import { MdzArchiveCore } from '@mdzip/core-js';
 import { unzipSync } from 'fflate';
 import { extractLinks, mentionsArchive } from './links';
 import { openArchive } from './mdz-view';
+import { matchLines } from './text-search';
 import { VaultLinks } from './vault-links';
 
 /** What the catalog knows about one archive. */
@@ -156,12 +157,9 @@ export class ArchiveCatalog {
       for (const doc of docs) {
         if (isCancelled() || count >= limit) return count;
         const text = inflateText(bytes, doc);
-        if (text === null || !text.toLocaleLowerCase().includes(needle)) continue;
-        const lines = text.split(/\r?\n/);
-        for (let i = 0; i < lines.length && count < limit; i++) {
-          const at = lines[i].toLocaleLowerCase().indexOf(needle);
-          if (at < 0) continue;
-          onMatch({ archive: file.path, doc, line: i, text: lines[i], start: at, end: at + needle.length });
+        if (text === null) continue;
+        for (const m of matchLines(text, query, limit - count)) {
+          onMatch({ archive: file.path, doc, ...m });
           count++;
         }
         // Yield so the UI stays responsive on large archives.

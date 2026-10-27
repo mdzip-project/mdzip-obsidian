@@ -100,8 +100,24 @@ export async function convertNoteToMdz(
     await view.save();
     const oldName = file.name;
     const mdzPath = availablePath(app, file.parent?.path ?? '', file.basename, 'mdz');
-    await app.fileManager.renameFile(file, mdzPath);
+    // renameFile only returns once links are updated, which with "Automatically
+    // update internal links" off waits for the user to answer Obsidian's
+    // question. Write the archive as soon as the file has its new name, so the
+    // .mdz never sits there holding the note's plain text.
+    let renamed!: () => void;
+    const hasNewName = new Promise<void>((resolve) => (renamed = resolve));
+    const ref = app.vault.on('rename', (f) => {
+      if (f === file) renamed();
+    });
+    const linkUpdate = app.fileManager.renameFile(file, mdzPath);
+    try {
+      await Promise.race([hasNewName, linkUpdate]);
+    } finally {
+      app.vault.offref(ref);
+    }
+    if (file.path !== mdzPath) throw new Error(`${oldName} could not be renamed to ${mdzPath}.`);
     await app.vault.modifyBinary(file, bytes);
+    linkUpdate.catch((err) => new Notice(`Updating links to ${file.name} failed: ${err instanceof Error ? err.message : String(err)}`));
 
     const leaf = view.leaf;
     await leaf.setViewState({
@@ -222,6 +238,8 @@ export class ConvertNoteModal extends Modal {
   constructor(
     app: App,
     private noteName: string,
+    /** Where "Paste normally" saves the image, as shown to the user (e.g. `Attachments/`). */
+    private pasteFolder: string,
     private onDecide: (convert: boolean, remember: boolean) => void
   ) {
     super(app);
@@ -241,6 +259,12 @@ export class ConvertNoteModal extends Modal {
         `Converting renames ${this.noteName} to ${mdzName} and updates links to it. ` +
         'Images the note already uses are copied into the archive; the originals stay in the vault.',
     });
+    const normally = contentEl.createEl('p');
+    normally.createEl('em', { text: 'Paste normally' });
+    normally.appendText(
+      ` saves the image as a separate file in ${this.pasteFolder}, ` +
+        "as set in Obsidian's Files and links settings (Default location for new attachments)."
+    );
 
     let remember = false;
     new Setting(contentEl)

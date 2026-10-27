@@ -1,6 +1,6 @@
-import { debounce, ItemView, setIcon, WorkspaceLeaf } from 'obsidian';
+import { debounce, ItemView, MarkdownView, setIcon, WorkspaceLeaf } from 'obsidian';
 import { ArchiveCatalog, SearchMatch } from './archive-catalog';
-import { VIEW_TYPE_MDZ } from './mdz-view';
+import { selectMatch, VIEW_TYPE_MDZ } from './mdz-view';
 
 export const VIEW_TYPE_MDZ_SEARCH = 'mdz-search';
 
@@ -145,5 +145,6 @@ export class MdzSearchView extends ItemView {
       { type: VIEW_TYPE_MDZ, state: { file: match.archive, mdzDoc: match.doc }, active: true },
       { line: match.line, cursor: { from: { line: match.line, ch: match.start }, to: { line: match.line, ch: match.end } } }
     );
+    if (leaf.view instanceof MarkdownView) selectMatch(leaf.view, match);
   }
 }

@@ -12,7 +12,7 @@ import {
   WorkspaceLeaf,
 } from 'obsidian';
 import { MdzArchiveCore } from '@mdzip/core-js';
-import { blockPadding, dropPosition, imageExtension, imageFiles, safeFileStem } from './images';
+import { blockPadding, dropPosition, imageExtension, imageFiles, readNow, safeFileStem } from './images';
 import type { LinkTarget, LinkUse } from './links';
 import { ArchiveIndex, indexOf, VaultLinks } from './vault-links';
 import type { ImageInsertMode } from './image-format';
@@ -166,7 +166,9 @@ export class MdzView extends MarkdownView {
         const files = imageFiles(evt.clipboardData);
         if (!files.length) return;
         evt.preventDefault();
-        void this.insertImages(files, editor, 'paste');
+        void readNow(files).then((read) => {
+          if (read.length) void this.insertImages(read, editor, 'paste');
+        });
       })
     );
     this.registerEvent(
@@ -175,7 +177,9 @@ export class MdzView extends MarkdownView {
         const files = imageFiles(evt.dataTransfer);
         if (!files.length) return;
         evt.preventDefault();
-        void this.insertImages(files, editor, 'drop', evt);
+        void readNow(files).then((read) => {
+          if (read.length) void this.insertImages(read, editor, 'drop', evt);
+        });
       })
     );
     // Raw HTML links (`<a href="Author/Book.md">`) don't go through Obsidian's
@@ -186,12 +190,12 @@ export class MdzView extends MarkdownView {
     // Header actions: the archive's contents and the Archive links panel.
     this.addAction('folder-tree', 'Show archive contents', () => {
       (this.app as unknown as { commands: { executeCommandById(id: string): boolean } }).commands.executeCommandById(
-        'mdzip-obsidian:show-contents'
+        'mdzip:show-contents'
       );
     });
     this.addAction('package-open', 'Show links for this document', () => {
       (this.app as unknown as { commands: { executeCommandById(id: string): boolean } }).commands.executeCommandById(
-        'mdzip-obsidian:show-links'
+        'mdzip:show-links'
       );
     });
 
@@ -383,15 +387,24 @@ export class MdzView extends MarkdownView {
    * one. Goes through the leaf's view state so it lands in back/forward
    * history.
    */
-  async openDocument(path: string, newLeaf?: PaneType | boolean, subpath?: string): Promise<void> {
+  async openDocument(
+    path: string,
+    newLeaf?: PaneType | boolean,
+    subpath?: string | { line: number; start: number; end: number }
+  ): Promise<void> {
     const file = this.file;
     if (!file) return;
     const leaf = newLeaf ? this.app.workspace.getLeaf(newLeaf) : this.leaf;
     const base = leaf === this.leaf ? this.getState() : { file: file.path, mode: this.getMode() };
-    await leaf.setViewState(
-      { type: VIEW_TYPE_MDZ, state: { ...base, mdzDoc: path }, active: true },
-      subpath ? { subpath } : undefined
-    );
+    // A line target selects the match, as Obsidian's search does.
+    const eState =
+      typeof subpath === 'string'
+        ? { subpath }
+        : subpath
+          ? { line: subpath.line, cursor: { from: { line: subpath.line, ch: subpath.start }, to: { line: subpath.line, ch: subpath.end } } }
+          : undefined;
+    await leaf.setViewState({ type: VIEW_TYPE_MDZ, state: { ...base, mdzDoc: path }, active: true }, eState);
+    if (subpath && typeof subpath !== 'string' && leaf.view instanceof MarkdownView) selectMatch(leaf.view, subpath);
   }
 
   private followHtmlLink(evt: MouseEvent): void {
@@ -476,7 +489,7 @@ export class MdzView extends MarkdownView {
         const crumb = el.createSpan({ cls: 'view-header-breadcrumb', text: part });
         crumb.addEventListener('click', () => {
           (this.app as unknown as { commands: { executeCommandById(id: string): boolean } }).commands.executeCommandById(
-            'mdzip-obsidian:show-contents'
+            'mdzip:show-contents'
           );
         });
       }
@@ -928,6 +941,20 @@ function pickDocument(archive: MdzArchiveCore, preferred: string | null, entryPo
 }
 
 /** Text of a document in the archive, or null if it isn't there. */
+/**
+ * Select a search match and scroll to it. Obsidian's line/cursor view state
+ * doesn't take after the view switches to another archive document, so this
+ * is done on the editor directly.
+ */
+export function selectMatch(view: MarkdownView, match: { line: number; start: number; end: number }): void {
+  const editor = view.editor;
+  if (match.line > editor.lastLine()) return;
+  const from = { line: match.line, ch: match.start };
+  const to = { line: match.line, ch: match.end };
+  editor.setSelection(from, to);
+  editor.scrollIntoView({ from, to }, true);
+}
+
 async function readDocument(archive: MdzArchiveCore, path: string): Promise<string | null> {
   const entry = archive.findEntry(path) as ZipEntryLike | null;
   if (!entry || entry.dir) return null;

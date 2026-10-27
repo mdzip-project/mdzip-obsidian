@@ -39,7 +39,6 @@ const input = (focus: string | null = null) => ({
   noteLinks,
   resolvedLinks: { 'MyVault/Linker.md': {}, 'MyVault/Notes.md': {} },
   focus,
-  filtered: false,
 });
 const edges = (d: GraphData) =>
   Object.entries(d.nodes).flatMap(([from, n]) => Object.keys(n.links).map((to) => `${from} -> ${to}`)).sort();
@@ -87,9 +86,34 @@ test('local graph of an archive centres on the focused document', () => {
   assert.equal(d.nodes['MyVault/Project.mdz/chapters/intro.md'].type, 'focused');
 });
 
-test('archive nodes are left out while the graph has a search filter', () => {
-  const d = addArchivesToGraph(obsidianData(), opts(), { ...input(), filtered: true });
+test('a search filter that excludes the archive file hides its documents', () => {
+  const match = (path: string) => path !== 'MyVault/Project.mdz';
+  const d = addArchivesToGraph(obsidianData(), opts(), { ...input(), match });
   assert.equal(d.nodes['MyVault/Project.mdz'], undefined);
+  assert.equal(d.nodes['MyVault/Project.mdz/chapters/intro.md'], undefined);
+  assert.deepEqual(edges(d), []);
+});
+
+test('a search filter that matches the archive file keeps its documents', () => {
+  const match = (path: string) => path === 'MyVault/Project.mdz' || path === 'MyVault/Linker.md';
+  const d = addArchivesToGraph(obsidianData(), opts(), { ...input(), match });
+  assert.ok(d.nodes['MyVault/Project.mdz/chapters/intro.md']);
+  // Notes.md is filtered out by Obsidian (not in its data) and must not come back via the archive's link.
+  const noNotes = addArchivesToGraph(
+    { nodes: { 'MyVault/Linker.md': obsidianData().nodes['MyVault/Linker.md'] } },
+    opts({ localFile: 'MyVault/Project.mdz' }),
+    { ...input(), match }
+  );
+  assert.equal(noNotes.nodes['MyVault/Notes.md'], undefined);
+});
+
+test('color groups keep archive documents and color them like their archive (issue #2)', () => {
+  const green = { a: 1, rgb: 0x00ff00 };
+  const match = (path: string) => (path === 'MyVault/Project.mdz' ? green : true);
+  const d = addArchivesToGraph(obsidianData(), opts(), { ...input(), match });
+  assert.equal(d.nodes['MyVault/Project.mdz'].color, green);
+  assert.equal(d.nodes['MyVault/Project.mdz/chapters/intro.md'].color, green);
+  assert.equal(d.nodes['MyVault/Notes.md'].color, undefined);
 });
 
 test('orphan archive documents are hidden when orphans are off', () => {

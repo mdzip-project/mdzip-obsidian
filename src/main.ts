@@ -23,7 +23,9 @@ import { addSupportFile, type SupportFileKind } from './support-files';
 import { archiveActions, type ArchiveActions } from './archive-actions';
 import { imageMarkup } from './image-insert-modal';
 import { ConvertNoteModal, convertNoteToMdz, InsertTarget, pasteIntoVault } from './convert';
-import { dropPosition, imageFiles } from './images';
+import { dropPosition, imageFiles, readNow } from './images';
+import { watchArchiveRenames } from './archive-rename';
+import { attachmentFolder, describeFolder } from './attachment-folder';
 import { DEFAULT_SETTINGS, MdzSettings, MdzSettingTab } from './settings';
 
 /**
@@ -95,6 +97,7 @@ export default class MdzPlugin extends Plugin {
     );
     this.register(() => this.graph.unhookAll());
     this.registerArchiveIndexing();
+    watchArchiveRenames(this);
     this.registerView(VIEW_TYPE_MDZ_SEARCH, (leaf) => new MdzSearchView(leaf, this.catalog));
     this.addRibbonIcon('package-search', 'Search MDZip archives', () => void this.openSearch());
     this.registerView(VIEW_TYPE_MDZ_LINKS, (leaf) => new MdzLinksView(leaf, () => this.linkIndex()));
@@ -184,9 +187,9 @@ export default class MdzPlugin extends Plugin {
         const files = imageFiles(evt.clipboardData);
         if (!evt.defaultPrevented && this.takesMarkdownImages(info, files)) {
           evt.preventDefault();
-          void this.handleMarkdownImages(info as MarkdownView, editor, files, 'paste', {
-            from: editor.getCursor('from'),
-            to: editor.getCursor('to'),
+          const target = { from: editor.getCursor('from'), to: editor.getCursor('to') };
+          void readNow(files).then((read) => {
+            if (read.length) void this.handleMarkdownImages(info as MarkdownView, editor, read, 'paste', target);
           });
         }
       })
@@ -198,7 +201,9 @@ export default class MdzPlugin extends Plugin {
           evt.preventDefault();
           const offset = dropPosition(editor, evt);
           const pos = offset !== null ? editor.offsetToPos(offset) : editor.getCursor();
-          void this.handleMarkdownImages(info as MarkdownView, editor, files, 'drop', { from: pos, to: pos });
+          void readNow(files).then((read) => {
+            if (read.length) void this.handleMarkdownImages(info as MarkdownView, editor, read, 'drop', { from: pos, to: pos });
+          });
         }
       })
     );
@@ -330,7 +335,9 @@ export default class MdzPlugin extends Plugin {
       await act(true);
       return;
     }
-    new ConvertNoteModal(this.app, file.name, (convert, remember) => {
+    const vaultConfig = this.app.vault as unknown as { getConfig(key: string): unknown };
+    const folder = attachmentFolder(vaultConfig.getConfig('attachmentFolderPath') as string | undefined, file.parent?.path ?? '');
+    new ConvertNoteModal(this.app, file.name, describeFolder(folder), (convert, remember) => {
       if (remember) {
         this.settings.markdownPaste = convert ? 'convert' : 'vault';
         void this.saveSettings();

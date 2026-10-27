@@ -415,8 +415,8 @@ def write_obsidian_config(vault: Path) -> None:
     cfg.mkdir(exist_ok=True)
     defaults = {
         "app.json": {"attachmentFolderPath": "Attachments", "newLinkFormat": "shortest", "showUnsupportedFiles": True},
-        "community-plugins.json": ["mdzip-obsidian"],
-        "core-plugins.json": ["file-explorer", "global-search", "switcher", "graph", "backlink", "outgoing-link", "page-preview", "word-count", "outline", "canvas", "daily-notes"],
+        "community-plugins.json": ["mdzip"],
+        "core-plugins.json": ["file-explorer", "global-search", "switcher", "graph", "backlink", "outgoing-link", "page-preview", "word-count", "outline", "canvas", "daily-notes", "command-palette"],
     }
     for name, value in defaults.items():
         path = cfg / name
@@ -425,7 +425,7 @@ def write_obsidian_config(vault: Path) -> None:
 
     plugins = cfg / "plugins"
     plugins.mkdir(exist_ok=True)
-    link = plugins / "mdzip-obsidian"
+    link = plugins / "mdzip"
     if link.exists() or link.is_symlink():
         return
     if os.name == "nt":

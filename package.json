@@ -1,12 +1,13 @@
 {
   "name": "mdzip-obsidian",
   "version": "0.1.0",
-  "description": "Obsidian plugin for reading and writing .mdz (MDZip) single-document archives.",
+  "description": "Open and edit .mdz (MDZip) archives: Markdown documents and their images in one file, with folders, links and search.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
-    "test": "node --test \"test/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\"",
+    "test:app": "node scripts/app-tests/run.mjs"
   },
   "keywords": [
     "obsidian",
@@ -24,7 +25,7 @@
     "typescript": "^5.4.0"
   },
   "dependencies": {
-    "@mdzip/core-js": "file:../mdzip-core-js",
+    "@mdzip/core-js": "^2.1.2",
     "fflate": "^0.8.3"
   }
 }

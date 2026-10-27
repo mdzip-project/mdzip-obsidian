@@ -1,4 +1,4 @@
-import { Editor, EditorPosition } from 'obsidian';
+import { Editor, EditorPosition, Notice } from 'obsidian';
 import { MdzArchiveCore } from '@mdzip/core-js';
 
 // Helpers for pasting and dropping images, shared by the .mdz view and the
@@ -8,6 +8,29 @@ import { MdzArchiveCore } from '@mdzip/core-js';
 export function imageFiles(data: DataTransfer | null): File[] {
   if (!data) return [];
   return Array.from(data.files).filter((f) => f.type.startsWith('image/'));
+}
+
+/**
+ * Copy pasted or dropped files into memory. Call it while the paste or drop
+ * event is being handled: on some platforms (Android) the files can only be
+ * read then, and come back empty once a dialog has been shown. Files that
+ * can't be read are left out, with a notice, rather than saved as broken
+ * images.
+ */
+export function readNow(files: File[]): Promise<File[]> {
+  const reads = files.map((f) =>
+    f.arrayBuffer().then(
+      (data) => (data.byteLength ? new File([data], f.name, { type: f.type, lastModified: f.lastModified }) : null),
+      () => null
+    )
+  );
+  return Promise.all(reads).then((copies) => {
+    const ok = copies.filter((c): c is File => c !== null);
+    if (ok.length < files.length) {
+      new Notice(ok.length ? "Some of the images couldn't be read and were skipped." : "The image couldn't be read, so nothing was pasted.");
+    }
+    return ok;
+  });
 }
 
 /** File extension for an image, from its MIME type (or its name). */

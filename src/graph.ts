@@ -30,8 +30,12 @@ export interface ArchiveGraphInput {
   resolvedLinks: Record<string, Record<string, number>>;
   /** Node to show as focused (the open archive document), if any. */
   focus: string | null;
-  /** True when the graph view has a search filter; archive nodes are then left out. */
-  filtered: boolean;
+  /**
+   * The graph's filter and color-group result for a vault path: `false` to
+   * hide it, `true` to show it, or a color to show it in. Archive documents
+   * take their archive file's result. Leave out to show everything.
+   */
+  match?: (path: string) => unknown;
 }
 
 /**
@@ -58,11 +62,11 @@ export function addArchivesToGraph(data: GraphData, options: GraphOptions, input
     if (!edges.has(from)) edges.set(from, new Set());
     edges.get(from)!.add(to);
   };
-  const archiveNodes = new Set<string>();
+  const archiveNodes = new Map<string, string>(); // node id → archive path
   for (const summary of input.summaries) {
     for (const doc of summary.docs) {
       const id = doc === summary.entryPoint ? summary.path : `${summary.path}/${doc}`;
-      archiveNodes.add(id);
+      archiveNodes.set(id, summary.path);
       for (const target of summary.links.get(doc) ?? []) addEdge(id, target);
     }
   }
@@ -87,7 +91,7 @@ export function addArchivesToGraph(data: GraphData, options: GraphOptions, input
     if (!stillUsed) delete nodes[id];
   }
 
-  if (input.filtered) return { ...data, nodes };
+  const verdict = (id: string): unknown => (input.match ? input.match(archiveNodes.get(id) ?? id) : true);
 
   // Which archive nodes to include.
   let include: Set<string>;
@@ -96,11 +100,13 @@ export function addArchivesToGraph(data: GraphData, options: GraphOptions, input
     include = neighbourhood(center, options, edges, input.resolvedLinks);
     include.add(center);
   } else {
-    include = new Set(archiveNodes);
+    include = new Set(archiveNodes.keys());
     for (const [from, tos] of edges) {
       if (nodes[from]) tos.forEach((t) => include.add(t));
     }
   }
+  // Nodes Obsidian already drew passed its filter; anything added here must too.
+  for (const id of include) if (!nodes[id] && verdict(id) === false) include.delete(id);
 
   const ensure = (id: string) => {
     if (!nodes[id]) nodes[id] = { type: '', links: {} };
@@ -129,7 +135,13 @@ export function addArchivesToGraph(data: GraphData, options: GraphOptions, input
         }
       }
     }
-    for (const id of archiveNodes) if (nodes[id] && !linked.has(id)) delete nodes[id];
+    for (const id of archiveNodes.keys()) if (nodes[id] && !linked.has(id)) delete nodes[id];
+  }
+
+  // Color groups: archive documents take their archive's color.
+  for (const id of archiveNodes.keys()) {
+    const v = nodes[id] ? verdict(id) : undefined;
+    if (v && typeof v !== 'boolean') nodes[id].color = v;
   }
 
   if (input.focus && nodes[input.focus]) {
@@ -180,8 +192,22 @@ function neighbourhood(
 
 interface GraphEngine {
   options: GraphOptions;
-  searchQueries: unknown[] | null;
+  /** The filter search (no color) plus every color group's query. */
+  searchQueries: { color: unknown }[] | null;
+  /** Vault path → false (filtered out), true, or the color group's color. */
+  fileFilter?: Record<string, unknown>;
+  /** True when the Filters search box has a query (color groups don't count). */
+  hasFilter?: boolean;
   render(): unknown;
+}
+
+/** Obsidian's own per-file filter result, as its graph engine applies it to vault files. */
+function engineMatch(engine: GraphEngine): ((path: string) => unknown) | undefined {
+  const queries = engine.searchQueries;
+  if (!queries?.length) return undefined;
+  const hasFilter = engine.hasFilter ?? queries.some((q) => !q.color);
+  const results = engine.fileFilter ?? {};
+  return (path) => (Object.prototype.hasOwnProperty.call(results, path) ? results[path] : !hasFilter);
 }
 interface GraphLikeView extends View {
   renderer?: { setData(data: GraphData): void };
@@ -195,7 +221,7 @@ interface GraphLikeView extends View {
  * graph view sees the added nodes (the metadata cache is untouched).
  */
 export class GraphIntegration {
-  private input: Omit<ArchiveGraphInput, 'focus' | 'filtered' | 'resolvedLinks'> = {
+  private input: Omit<ArchiveGraphInput, 'focus' | 'match' | 'resolvedLinks'> = {
     summaries: [],
     noteLinks: new Map(),
   };
@@ -241,7 +267,7 @@ export class GraphIntegration {
             ...this.input,
             resolvedLinks: this.app.metadataCache.resolvedLinks,
             focus: this.focusFor(options.localFile),
-            filtered: !!engine.searchQueries?.length,
+            match: engineMatch(engine),
           });
         } catch (err) {
           console.error('MDZip: could not add archives to the graph', err);
